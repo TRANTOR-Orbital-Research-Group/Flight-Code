@@ -45,3 +45,8 @@ embedded-sdmmc = "0.8.1"
 embedded-hal = "1.0.0"
 panic-halt = "1.0.0"
 rp235x-hal = { version = "0.3.0", features = ["critical-section-impl"] }
+
+
+# Trying to get serial to work
+embassy-usb-logger = "0.5.1"
+log = "0.4"
