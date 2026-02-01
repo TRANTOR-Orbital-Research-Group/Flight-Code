@@ -4,7 +4,7 @@ version = "0.2.0"
 edition = "2024"
 
 [[bin]]
-name = "flight-code" 
+name = "flight-code"
 test = false
 bench = false
 
@@ -37,11 +37,13 @@ defmt-rtt = "1.1.0"
 
 
 # SD card dependencies
-embedded-hal-bus = "0.2.0"
+embedded-hal-bus = "0.3.0"
 usbd-serial = "0.2.2"
 usb-device = "0.3.2"
-heapless = "0.8.0"
-embedded-sdmmc = "0.8.1"
+heapless = "0.9.2"
+embedded-sdmmc = "0.8.2"
 embedded-hal = "1.0.0"
 panic-halt = "1.0.0"
-rp235x-hal = { version = "0.3.0", features = ["critical-section-impl"] }
+rp235x-hal = { version = "0.4.0", features = ["critical-section-impl"] }
+mfrc522 = "0.8.0"
+log = "0.4.29"
