@@ -1,159 +1,152 @@
 #![no_std]
 #![no_main]
 
-use embedded_hal::delay::DelayNs;
+use rp235x_hal as hal;
+use {panic_probe as _};
+use embedded_hal::digital::OutputPin;
+use defmt_rtt as _;
+use rp235x_hal::reboot::{reboot, RebootKind, RebootArch};
+
+// Tells the Rust where to put the actual image (I think) 
 use hal::block::ImageDef;
-use panic_halt as _;
-use rp235x_hal::{self as hal, Clock};
-
-use usb_device::{class_prelude::*, prelude::*};
-use usbd_serial::SerialPort;
-
-use hal::fugit::RateExtU32;
-use heapless::String;
-
-use core::fmt::Write;
-
-use embedded_hal_bus::spi::ExclusiveDevice;
-use embedded_sdmmc::{SdCard, TimeSource, Timestamp, VolumeIdx, VolumeManager};
-
 #[unsafe(link_section = ".start_block")]
 #[used]
 pub static IMAGE_DEF: ImageDef = hal::block::ImageDef::secure_exe();
 
-const XTAL_FREQ_HZ: u32 = 12_000_000u32;
 
-/// A dummy timesource, which is mostly important for creating files.
-#[derive(Default)]
-pub struct DummyTimesource();
+// This is where the actual RTIC application starts. We see the device as our hal's peripheral access crate and the dispacter,
+// which is the interrupt vector for the software tasks. This means that all of our software interrupts use the UART0_IRQ interrupt vector
+// which means that they all have a priority 2 for RTIC. We can (and likely will) add more dispatchers later so that we can have different 
+// priorities for all of our different software tasks
+#[rtic::app(device = hal::pac, dispatchers = [UART0_IRQ])]
+mod app {
+    use super::*;
+    use usb_device::{class_prelude::*, prelude::*};
+    use usbd_serial::SerialPort;
 
-impl TimeSource for DummyTimesource {
-    // In theory you could use the RTC of the rp2040 here, if you had
-    // any external time synchronizing device.
-    fn get_timestamp(&self) -> Timestamp {
-        Timestamp {
-            year_since_1970: 0,
-            zero_indexed_month: 0,
-            zero_indexed_day: 0,
-            hours: 0,
-            minutes: 0,
-            seconds: 0,
-        }
+    // Where you put the shared resources (we don't have to name the struct shared, that was just convienent(we could have named it Steven).)
+    // We can have as many of these as we want, we just have to name them different things and make sure we say that they are all shared
+    #[shared]
+    struct Shared {
+        // Resources shared between different tasks (none right now, because we don't have any other tasks)
     }
-}
 
-#[hal::entry]
-fn main() -> ! {
-    let mut pac = hal::pac::Peripherals::take().unwrap();
-    let mut watchdog = hal::Watchdog::new(pac.WATCHDOG);
+    // Same thing as shared but it is only going to be in one task (These will belong to the idle task)
+    #[local]
+    struct Local {
+        led: hal::gpio::Pin<hal::gpio::bank0::Gpio25, hal::gpio::FunctionSioOutput, hal::gpio::PullDown>,
+        timer: hal::Timer<hal::timer::CopyableTimer0>,
+        usb_dev: UsbDevice<'static, hal::usb::UsbBus>,
+        serial: SerialPort<'static, hal::usb::UsbBus>,
+    }
 
-    let clocks = hal::clocks::init_clocks_and_plls(
-        XTAL_FREQ_HZ,
-        pac.XOSC,
-        pac.CLOCKS,
-        pac.PLL_SYS,
-        pac.PLL_USB,
-        &mut pac.RESETS,
-        &mut watchdog,
-    )
-    .ok()
-    .unwrap();
-    let mut timer = hal::Timer::new_timer0(pac.TIMER0, &mut pac.RESETS, &clocks);
+    // This is the init task, which is a lot like the `void setup()` function in Arduino cpp
+    // Note that it creates the Shared and Local structs that our tasks get to use
+    #[init(local = [usb_bus: Option<UsbBusAllocator<hal::usb::UsbBus>> = None])]
+    fn init(cx: init::Context) -> (Shared, Local) {
 
-    let sio = hal::Sio::new(pac.SIO);
-    let pins = hal::gpio::Pins::new(
-        pac.IO_BANK0,
-        pac.PADS_BANK0,
-        sio.gpio_bank0,
-        &mut pac.RESETS,
-    );
+        // All of the peripherals are off when the pico powers on, so we need the resets controller to be able to turn them on
+        // That is what this is
+        let mut resets = cx.device.RESETS;
 
-    let usb_bus = UsbBusAllocator::new(hal::usb::UsbBus::new(
-        pac.USB,
-        pac.USB_DPRAM,
-        clocks.usb_clock,
-        true,
-        &mut pac.RESETS,
-    ));
+        // This is the builtin watchdog. We will likely use it for flights, but for now we need it just so that we can use the clock
+        let mut watchdog = hal::Watchdog::new(cx.device.WATCHDOG);
+        
+        // Just what it sounds like, the clock of the pico
+        let clocks = hal::clocks::init_clocks_and_plls(
+            12_000_000u32,
+            cx.device.XOSC,
+            cx.device.CLOCKS,
+            cx.device.PLL_SYS,
+            cx.device.PLL_USB,
+            &mut resets,
+            &mut watchdog,
+        ).ok().unwrap();
 
-    let mut serial = SerialPort::new(&usb_bus);
+        // This is the Single cycle Input Output devices, which are basically just some fast gpio pins that connect close to the 
+        // cpu as best as I can figure. We use them to create the pins just down a few lines
+        let sio = hal::Sio::new(cx.device.SIO);
 
-    let mut usb_dev = UsbDeviceBuilder::new(&usb_bus, UsbVidPid(0x16c0, 0x27dd))
-        .strings(&[StringDescriptors::default()
-            .manufacturer("implRust")
-            .product("Ferris")
-            .serial_number("TEST")])
-        .unwrap()
-        .device_class(2) // 2 for the CDC, from: https://www.usb.org/defined-class-codes
-        .build();
+        // The struct that holds all of the - you guessed it! - pins
+        let pins = hal::gpio::Pins::new(cx.device.IO_BANK0, cx.device.PADS_BANK0, sio.gpio_bank0, &mut resets);
 
-    let spi_cs = pins.gpio1.into_push_pull_output();
-    let spi_sck = pins.gpio2.into_function::<hal::gpio::FunctionSpi>();
-    let spi_mosi = pins.gpio3.into_function::<hal::gpio::FunctionSpi>();
-    let spi_miso = pins.gpio4.into_function::<hal::gpio::FunctionSpi>();
-    let spi_bus = hal::spi::Spi::<_, _, _, 8>::new(pac.SPI0, (spi_mosi, spi_miso, spi_sck));
+        // The led that we want to play with
+        let led = pins.gpio25.into_push_pull_output();
 
-    let spi = spi_bus.init(
-        &mut pac.RESETS,
-        clocks.peripheral_clock.freq(),
-        400.kHz(), // card initialization happens at low baud rate
-        embedded_hal::spi::MODE_0,
-    );
+        // The timer that we need in our Local struct for our idle task
+        let timer = hal::Timer::new_timer0(cx.device.TIMER0, &mut resets, &clocks);
 
-    let spi = ExclusiveDevice::new(spi, spi_cs, timer).unwrap();
-    let sdcard = SdCard::new(spi, timer);
-    let mut buff: String<64> = String::new();
+        // Initializing the usb bus so that we can make a device that uses the bus for our Local struct
+        let usb_bus_alloc = cx.local.usb_bus.insert(UsbBusAllocator::new(
+            hal::usb::UsbBus::new(cx.device.USB, cx.device.USB_DPRAM, clocks.usb_clock, true, &mut resets)
+        ));
 
-    let mut volume_mgr = VolumeManager::new(sdcard, DummyTimesource::default());
+        // Creating a serial port on the bus
+        let serial = SerialPort::new(usb_bus_alloc);
 
-    let mut is_read = false;
-    loop {
-        let _ = usb_dev.poll(&mut [&mut serial]);
-        if !is_read && timer.get_counter().ticks() >= 2_000_000 {
-            is_read = true;
-            serial
-                .write("Init SD card controller and retrieve card size...".as_bytes())
-                .unwrap();
-            match volume_mgr.device().num_bytes() {
-                Ok(size) => {
-                    write!(buff, "card size is {} bytes\r\n", size).unwrap();
-                    serial.write(buff.as_bytes()).unwrap();
-                }
-                Err(e) => {
-                    write!(buff, "Error: {:?}", e).unwrap();
-                    serial.write(buff.as_bytes()).unwrap();
+        // Creating a serial device that uses that port and that bus
+        let usb_dev = UsbDeviceBuilder::new(usb_bus_alloc, UsbVidPid(0x16c0, 0x27dd))
+            .strings(&[StringDescriptors::default().product("RTIC Serial")])
+            .unwrap()
+            .device_class(2)
+            .build();
+        
+        // Returning our two structs
+        (Shared {}, Local { led, timer, usb_dev, serial })
+    }
+
+
+
+    // This is the idle loop. The idle loop is the basically the `void loop()` part of C++ Arduino
+    // The thing above it is a flag that tells Rust what it will have in scope; currently we just have 
+    // a local set of variables because we don't need any shared variables right now
+    // It takes in a context, which is how you access all of the variables in local and shared.
+    #[idle(shared = [], local = [timer, serial, led, usb_dev])]
+    fn idle(cx: idle::Context) -> ! {
+
+        // This is a simple last time timer implementation
+        let mut last_send = cx.local.timer.get_counter();
+
+        // The interval that we are waiting on to send a heartbeat
+        let interval = fugit::MicrosDurationU64::micros(2_000_000);
+
+        // This is what you can think of as the actual loop. 
+        loop {
+
+            // Polling the usb device to see if we have anything extra to play with from the other device
+            if cx.local.usb_dev.poll(&mut [cx.local.serial]) {
+
+                // If we do have stuff to play with, we create a buffer where the serial object can put the information in it
+                let mut buf = [0u8; 64];
+
+                // Now we try to read the buffer from the serial object
+                if let Ok(count) = cx.local.serial.read(&mut buf) {
+
+                    // Then we just iterate through the buffer to see if the key 'r' shows up in it in binary 
+                    for &byte in &buf[..count] {
+                        if byte == b'l' { 
+                            let _ = cx.local.led.set_high(); 
+                        } else if byte == b'b' { 
+                            reboot(RebootKind::BootSel {picoboot_disabled: false, msd_disabled: false}, RebootArch::Arm); // Exiting so that we don't need to hit the boot sel button
+                        } else { 
+                            let _ = cx.local.led.set_low(); 
+                        }
+                    }
                 }
             }
-            buff.clear();
 
-            let Ok(mut volume0) = volume_mgr.open_volume(VolumeIdx(0)) else {
-                let _ = serial.write("err in open_volume".as_bytes());
-                continue;
-            };
+            // The current time (get_counter is a lot like millis in cpp)
+            let now = cx.local.timer.get_counter();
 
-            let Ok(mut root_dir) = volume0.open_root_dir() else {
-                serial.write("err in open_root_dir".as_bytes()).unwrap();
-                continue;
-            };
-
-            let Ok(mut my_file) =
-                root_dir.open_file_in_dir("RUST.TXT", embedded_sdmmc::Mode::ReadOnly)
-            else {
-                serial.write("err in open_file_in_dir".as_bytes()).unwrap();
-                continue;
-            };
-
-            while !my_file.is_eof() {
-                let mut buffer = [0u8; 32];
-                let num_read = my_file.read(&mut buffer).unwrap();
-                for b in &buffer[0..num_read] {
-                    write!(buff, "{}", *b as char).unwrap();
-                }
+            // Checking to see if enough time has passed to send a heartbeat
+            if (now - last_send) >= interval {
+                let _ = cx.local.serial.write(b"I like waffle fries!\r\n");
+                last_send = now;
             }
-            serial.write(buff.as_bytes()).unwrap();
-        }
-        buff.clear();
 
-        timer.delay_ms(50);
+            // Putting the CPU to sleed until the next interrupt (Good practice, but we won't be doing it right now)
+            // cortex_m::asm::wfi(); 
+        }
     }
+
 }
