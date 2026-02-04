@@ -1,28 +1,18 @@
-/* 
- * 
- * Attempting to get the BME280 working with the pico.
- * 
- */
-
-
 #![no_std]
 #![no_main]
 
-use rp235x_hal::{self as hal, gpio::Pins, i2c::I2C, Sio, Timer};
+use rp235x_hal as hal;
 use {panic_probe as _};
 use embedded_hal::digital::OutputPin;
 use defmt_rtt as _;
 use rp235x_hal::reboot::{reboot, RebootKind, RebootArch};
-use fugit::RateExtU32;
-use heapless::String;
-use core::fmt::Write;
-
 
 // Tells the Rust where to put the actual image (I think) 
 use hal::block::ImageDef;
 #[unsafe(link_section = ".start_block")]
 #[used]
 pub static IMAGE_DEF: ImageDef = hal::block::ImageDef::secure_exe();
+
 
 // This is where the actual RTIC application starts. We see the device as our hal's peripheral access crate and the dispacter,
 // which is the interrupt vector for the software tasks. This means that all of our software interrupts use the UART0_IRQ interrupt vector
@@ -31,8 +21,6 @@ pub static IMAGE_DEF: ImageDef = hal::block::ImageDef::secure_exe();
 #[rtic::app(device = hal::pac, dispatchers = [UART0_IRQ])]
 mod app {
     use super::*;
-    use bme280::i2c::BME280;
-    use rp235x_hal::{pac::{I2C0, otp_data::key1_3}, timer::CopyableTimer0};
     use usb_device::{class_prelude::*, prelude::*};
     use usbd_serial::SerialPort;
 
@@ -50,29 +38,7 @@ mod app {
         timer: hal::Timer<hal::timer::CopyableTimer0>,
         usb_dev: UsbDevice<'static, hal::usb::UsbBus>,
         serial: SerialPort<'static, hal::usb::UsbBus>,
-
-        // I apologize profusely because of how horrible this looks
-        // We should be able to make a type out of this later for readability though
-        bme: BME280<
-            rp235x_hal::I2C<
-                rp235x_hal::pac::I2C1,
-                (
-                    rp235x_hal::gpio::Pin<
-                        rp235x_hal::gpio::bank0::Gpio18,
-                        rp235x_hal::gpio::FunctionI2c,
-                        rp235x_hal::gpio::PullUp,
-                    >,
-                    rp235x_hal::gpio::Pin<
-                        rp235x_hal::gpio::bank0::Gpio19,
-                        rp235x_hal::gpio::FunctionI2c,
-                        rp235x_hal::gpio::PullUp,
-                    >,
-                ),
-            >
-        >,
-
     }
-
 
     // This is the init task, which is a lot like the `void setup()` function in Arduino cpp
     // Note that it creates the Shared and Local structs that our tasks get to use
@@ -108,7 +74,7 @@ mod app {
         let led = pins.gpio25.into_push_pull_output();
 
         // The timer that we need in our Local struct for our idle task
-        let mut timer = hal::Timer::new_timer0(cx.device.TIMER0, &mut resets, &clocks);
+        let timer = hal::Timer::new_timer0(cx.device.TIMER0, &mut resets, &clocks);
 
         // Initializing the usb bus so that we can make a device that uses the bus for our Local struct
         let usb_bus_alloc = cx.local.usb_bus.insert(UsbBusAllocator::new(
@@ -124,27 +90,9 @@ mod app {
             .unwrap()
             .device_class(2)
             .build();
-
-        // -----------------------------------Added Stuff-----------------------------------
-
-        // Creating a new i2c bus on pins 18 and 19
-        let i2c = I2C::i2c1(
-                cx.device.I2C1,
-                pins.gpio18.reconfigure(), // sda
-                pins.gpio19.reconfigure(), // scl
-                400.kHz(),
-                &mut resets,
-                125_000_000.Hz(),
-        );
-
-        // Creating the BME
-        let mut bme = BME280::new_secondary(i2c);
-        bme.init(&mut timer).unwrap();
-
-        // ---------------------------------------------------------------------------------
         
         // Returning our two structs
-        (Shared {}, Local { led, timer, usb_dev, serial, bme })
+        (Shared {}, Local { led, timer, usb_dev, serial })
     }
 
 
@@ -153,7 +101,7 @@ mod app {
     // The thing above it is a flag that tells Rust what it will have in scope; currently we just have 
     // a local set of variables because we don't need any shared variables right now
     // It takes in a context, which is how you access all of the variables in local and shared.
-    #[idle(shared = [], local = [ led, timer, usb_dev, serial, bme ])]
+    #[idle(shared = [], local = [timer, serial, led, usb_dev])]
     fn idle(cx: idle::Context) -> ! {
 
         // This is a simple last time timer implementation
@@ -192,23 +140,7 @@ mod app {
 
             // Checking to see if enough time has passed to send a heartbeat
             if (now - last_send) >= interval {
-
-                // -----------------------------------Added Stuff-----------------------------------
-
-                // Taking the measurements
-                let measurements = cx.local.bme.measure(cx.local.timer).unwrap();
-
-                // Creating the message string (make sure this isn't too small, if you do it just straight up panics)
-                let mut message: String<128> = String::new();
-                write!(message, "Humidity: {}%\n\rTemperature: {} deg C\n\rPressure: {} pascals\n\r", measurements.humidity, measurements.temperature, measurements.pressure).unwrap();
-
-                // Writing it 
-                let _ = cx.local.serial.write(message.as_bytes());
-                
-
-                // -----------------------------------End Added Stuff-----------------------------------
-
-                // let _ = cx.local.serial.write(b"Connected and looping\r\n");
+                let _ = cx.local.serial.write(b"I like waffle fries!\r\n");
                 last_send = now;
             }
 

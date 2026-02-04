@@ -163,32 +163,13 @@ mod app {
         let interval = fugit::MicrosDurationU64::micros(2_000_000);
 
         // This is what you can think of as the actual loop. 
-        loop {
-
-            // Polling the usb device to see if we have anything extra to play with from the other device
-            if cx.local.usb_dev.poll(&mut [cx.local.serial]) {
-
-                // If we do have stuff to play with, we create a buffer where the serial object can put the information in it
-                let mut buf = [0u8; 64];
-
-                // Now we try to read the buffer from the serial object
-                if let Ok(count) = cx.local.serial.read(&mut buf) {
-
-                    // Then we just iterate through the buffer to see if the key 'r' shows up in it in binary 
-                    for &byte in &buf[..count] {
-                        if byte == b'l' { 
-                            let _ = cx.local.led.set_high(); 
-                        } else if byte == b'b' { 
-                            reboot(RebootKind::BootSel {picoboot_disabled: false, msd_disabled: false}, RebootArch::Arm); // Exiting so that we don't need to hit the boot sel button
-                        } else { 
-                            let _ = cx.local.led.set_low(); 
-                        }
-                    }
-                }
-            }
+        loop { 
 
             // The current time (get_counter is a lot like millis in cpp)
             let now = cx.local.timer.get_counter();
+
+            // Polling the usb bus so that we can communicate over it 
+            cx.local.usb_dev.poll(&mut [cx.local.serial]);
 
             // Checking to see if enough time has passed to send a heartbeat
             if (now - last_send) >= interval {

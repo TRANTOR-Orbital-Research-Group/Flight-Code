@@ -3,7 +3,8 @@
 
 use rp235x_hal as hal;
 use hal::block::ImageDef;
-use embedded_hal::delay::DelayNs;
+use rp235x_hal::spi;
+use embedded_hal::digital::OutputPin;
 use {panic_probe as _};
 use defmt_rtt as _;
 /// Tell the Boot ROM about our application
@@ -13,20 +14,33 @@ pub static IMAGE_DEF: ImageDef = hal::block::ImageDef::secure_exe();
 /// External high-speed crystal on the Raspberry Pi Pico 2 board is 12 MHz.
 /// Adjust if your board has a different frequency
 const XTAL_FREQ_HZ: u32 = 12_000_000u32;
-
-
-
-
 // USB Device support
 use usb_device::{class_prelude::*, prelude::*};
-
 // USB Communications Class Device support
 use usbd_serial::SerialPort;
 
-// For the LED
-use embedded_hal::digital::OutputPin;
 
 
+
+/// Code from https://github.com/rp-rs/rp-hal-boards/blob/main/boards/rp-pico/examples/pico_spi_sd_card.rs
+/// A dummy timesource, which is mostly important for creating files.
+#[derive(Default)]
+pub struct DummyTimesource();
+
+// impl TimeSource for DummyTimesource {
+//     // In theory you could use the RTC of the rp2040 here, if you had
+//     // any external time synchronizing device.
+//     fn get_timestamp(&self) -> Timestamp {
+//         Timestamp {
+//             year_since_1970: 0,
+//             zero_indexed_month: 0,
+//             zero_indexed_day: 0,
+//             hours: 0,
+//             minutes: 0,
+//             seconds: 0,
+//         }
+//     }
+// }
 
 
 #[hal::entry]
@@ -92,11 +106,8 @@ fn main() -> ! {
     .device_class(2) // 2 for the CDC, from: https://www.usb.org/defined-class-codes
     .build();
 
-    // Keeping track of whether we have recieved a message from the computer
-    let mut said_hello = false;
-
+    // Keeping track of timing so that we don't spam too much
     let mut ticks = 0;
-
     
 
     loop{
@@ -105,7 +116,7 @@ fn main() -> ! {
         ticks += 1;
 
         // Responding if it hasn't said hello
-        if !said_hello && ticks > 1_000_000 {
+        if ticks > 1_000_000 {
             // Writes bytes from `data` into the port and returns the number of bytes written.
             let _ = serial.write(b"Hello, Rust!\r\n");
             ticks -= 1_000_00;
