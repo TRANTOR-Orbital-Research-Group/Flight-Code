@@ -2,14 +2,7 @@
 #![no_main]
 use embedded_hal::delay::DelayNs;
 use rp235x_hal::{self as hal, Clock};
-// For SPI
-use embassy_rp::spi;
-use embassy_rp::spi::Spi;
-use embassy_time::Delay;
 use embedded_hal_bus::spi::ExclusiveDevice;
-
-// For CS Pin
-use embassy_rp::gpio::{Level, Output};
 
 // For SdCard
 use embedded_sdmmc::{SdCard, TimeSource, Timestamp, VolumeIdx, VolumeManager};
@@ -88,10 +81,7 @@ fn main() -> ! {
     );
     let spi = ExclusiveDevice::new(spi, spi_cs, timer).unwrap();
 
-    let mut config = spi::Config::default();
-    config.frequency = 400_000;
-
-    let sdcard = SdCard::new(spi, Delay);
+    let sdcard = SdCard::new(spi, timer);
 
     //Read SD card size to verify initialization
     log::info!("Init SD card controller and retrieve card size...");

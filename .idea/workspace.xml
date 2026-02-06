@@ -12,7 +12,7 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="10f5df0f-d914-43cd-a59b-c84232e57b50" name="Changes" comment="">
-      <change afterPath="$PROJECT_DIR$/examples/sd_write.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/Cargo.lock" beforeDir="false" afterPath="$PROJECT_DIR$/Cargo.lock" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/Cargo.toml" beforeDir="false" afterPath="$PROJECT_DIR$/Cargo.toml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/main.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/main.rs" afterDir="false" />
@@ -88,7 +88,10 @@
       <workItem from="1769369570904" duration="7193000" />
       <workItem from="1769470341107" duration="165000" />
       <workItem from="1769975497712" duration="5437000" />
-      <workItem from="1769980997275" duration="3186000" />
+      <workItem from="1769980997275" duration="3416000" />
+      <workItem from="1769992441107" duration="2000" />
+      <workItem from="1770075306818" duration="11000" />
+      <workItem from="1770404428551" duration="2288000" />
     </task>
     <servers />
   </component>
