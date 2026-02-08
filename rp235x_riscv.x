@@ -250,4 +250,3 @@ then modify your build script to compile the C code _without_ the
 details.");
 
 /* Do not exceed this mark in the error messages above                                    | */
-
