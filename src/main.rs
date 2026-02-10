@@ -106,6 +106,11 @@ fn main() -> ! {
         .device_class(2) // 2 for the CDC, from: https://www.usb.org/defined-class-codes
         .build();
 
+    //Give USB device time to initialize before use
+    for _ in 0..50_000 {
+        usb_dev.poll(&mut [&mut serial]);
+    }
+
     let spi_cs = pins.gpio1.into_push_pull_output();
     let spi_sck = pins.gpio2.into_function::<hal::gpio::FunctionSpi>();
     let spi_mosi = pins.gpio3.into_function::<hal::gpio::FunctionSpi>();
@@ -124,21 +129,23 @@ fn main() -> ! {
 
     let sd_size = sdcard.num_bytes();
 
-    // Getting the LED pin ready
-    let mut led = pins.gpio25.into_push_pull_output();
-
+    // Now the program hangs indefinitely on open, but the com port is readable
     let mut volume_mgr = VolumeManager::new(sdcard, DummyTimesource::default());
-
-    //While this block is in the code, the associated COM port is not readable
     let mut volume0 = volume_mgr
         .open_volume(VolumeIdx(0))
         .unwrap();
-    ////////////
 
-    //let mut root_dir = volume0.open_root_dir().expect("failed to open root dir");
+    let mut root_dir = volume0.open_root_dir().expect("failed to open root dir");
+
+    let mut my_file = root_dir
+        .open_file_in_dir("RUST.TXT", embedded_sdmmc::Mode::ReadOnly)
+        .expect("failed to open RUST.TXT file");
+
     let mut ticks = 0;
 
     loop{
+        usb_dev.poll(&mut [&mut serial]);
+
         // Updating the ticks
         ticks += 1;
 
@@ -149,18 +156,16 @@ fn main() -> ! {
             ticks -= 1_000_000;
         }
 
-        if usb_dev.poll(&mut [&mut serial]) {
-            let mut buf = [0u8; 64];
-            if let Ok(count) = serial.read(&mut buf) {
-                for &byte in &buf[..count] {
-                    if byte == b'r' {
-                        led.set_high().expect("unable to turn on LED");
-                    } else {
-                        led.set_low().expect("unable to turn off LED");
-                    }
+        if !my_file.is_eof() && serial.dtr() {
+            let mut buffer = [0u8; 32];
+
+            if let Ok(n) = my_file.read(&mut buffer) {
+                if let Ok(s) = core::str::from_utf8(&buffer[..n]) {
+                    serial.write(s.as_bytes()).unwrap();
+                } else {
+                    serial.write(&buffer[..n]).unwrap();
                 }
             }
         }
-
     }
 }
