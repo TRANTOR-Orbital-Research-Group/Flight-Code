@@ -1,6 +1,6 @@
 /* 
  * 
- * Attempting to get the BME280 working with the pico.
+ * Attempting to get the M9N working with the pico.
  * 
  */
 
@@ -18,6 +18,25 @@ use heapless::String;
 use core::fmt::Write;
 
 
+// -------------------------Added stuff-------------------------
+use ublox::{Parser, UbxPacketMeta, FixedLinearBuffer, UbxPacket}; 
+use embedded_hal::i2c::I2c;
+use hal::prelude::*;
+use ublox::proto23::PacketRef; // For the m9n
+// use ublox::proto14::PacketRef; // For the m8q
+// use ublox::UbxPacketMeta; // Debug
+use core::convert::TryFrom;
+// use ublox::nav_pvt::proto14::NavPvtRef;
+use ublox::nav_pvt::proto23::NavPvtRef;
+
+// Here are the constants for the GPS, we will likely be creating a GPS struct to hold these
+const M9N_ADDR: u8 = 0x42;
+
+
+
+// -------------------------End added stuff-------------------------
+
+
 // Tells the Rust where to put the actual image (I think) 
 use hal::block::ImageDef;
 #[unsafe(link_section = ".start_block")]
@@ -32,9 +51,14 @@ pub static IMAGE_DEF: ImageDef = hal::block::ImageDef::secure_exe();
 mod app {
     use super::*;
     use bme280::i2c::BME280;
+    use cortex_m::prelude::_embedded_hal_blocking_delay_DelayMs;
     use rp235x_hal::{pac::{I2C0, otp_data::key1_3}, timer::CopyableTimer0};
     use usb_device::{class_prelude::*, prelude::*};
     use usbd_serial::SerialPort;
+    use ublox::UbxPacketMeta;
+    // use ublox::nav_pvt::proto14::NavPvtRef;
+    use ublox::nav_pvt::proto23::NavPvtRef;
+    use core::convert::TryFrom;
 
     // Where you put the shared resources (we don't have to name the struct shared, that was just convienent(we could have named it Steven).)
     // We can have as many of these as we want, we just have to name them different things and make sure we say that they are all shared
@@ -51,10 +75,16 @@ mod app {
         usb_dev: UsbDevice<'static, hal::usb::UsbBus>,
         serial: SerialPort<'static, hal::usb::UsbBus>,
 
-        // I apologize profusely because of how horrible this looks
-        // We should be able to make a type out of this later for readability though
-        bme: BME280<
-            rp235x_hal::I2C<
+        // -------------------------Added stuff-------------------------
+
+        // Note the static lifetime; FixedLinearBuffer doesn't own the buffer, just a reference,
+        // so if the reference goes out of scope, then everything breaks. Rust gets around that with lifetimes
+        // I didn't want to deal with that right now, so I declared it static (so that it never goes out of scope.)
+        parser: Parser<FixedLinearBuffer<'static>>,
+
+        // Now we are just passing the I2C itself to read directly for the GPS
+        // This should all be abstracted away later 
+        i2c: rp235x_hal::I2C<
                 rp235x_hal::pac::I2C1,
                 (
                     rp235x_hal::gpio::Pin<
@@ -69,14 +99,14 @@ mod app {
                     >,
                 ),
             >
-        >,
+        // -------------------------End added stuff-------------------------
 
     }
 
 
     // This is the init task, which is a lot like the `void setup()` function in Arduino cpp
     // Note that it creates the Shared and Local structs that our tasks get to use
-    #[init(local = [usb_bus: Option<UsbBusAllocator<hal::usb::UsbBus>> = None])]
+    #[init(local = [usb_bus: Option<UsbBusAllocator<hal::usb::UsbBus>> = None, gps_raw_buffer: [u8; 1024] = [0u8; 1024]])]
     fn init(cx: init::Context) -> (Shared, Local) {
 
         // All of the peripherals are off when the pico powers on, so we need the resets controller to be able to turn them on
@@ -105,7 +135,7 @@ mod app {
         let pins = hal::gpio::Pins::new(cx.device.IO_BANK0, cx.device.PADS_BANK0, sio.gpio_bank0, &mut resets);
 
         // The led that we want to play with
-        let led = pins.gpio25.into_push_pull_output();
+        let mut led = pins.gpio25.into_push_pull_output();
 
         // The timer that we need in our Local struct for our idle task
         let mut timer = hal::Timer::new_timer0(cx.device.TIMER0, &mut resets, &clocks);
@@ -128,23 +158,36 @@ mod app {
         // -----------------------------------Added Stuff-----------------------------------
 
         // Creating a new i2c bus on pins 18 and 19
-        let i2c = I2C::i2c1(
+        let mut i2c = I2C::i2c1(
                 cx.device.I2C1,
-                pins.gpio18.reconfigure(), // sda
-                pins.gpio19.reconfigure(), // scl
-                400.kHz(),
+                pins.gpio18.reconfigure(),  // sda
+                pins.gpio19.reconfigure(),  // scl
+                100.kHz(),                  // The M8Q I was testing with requires the I2C frequency to be max 100kHz, but the M9N is fine at 400
                 &mut resets,
-                125_000_000.Hz(),
+                clocks.peripheral_clock.freq(),
         );
 
-        // Creating the BME
-        let mut bme = BME280::new_secondary(i2c);
-        bme.init(&mut timer).unwrap();
 
+        
+        // Telling the GPS that we want the navagation packets
+        let enable_nav_pvt = [
+            0xB5, 0x62, 0x06, 0x01, 0x03, 0x00, 
+            0x01, 0x07, 0x01,
+            0x13, 0x51        
+        ];
+        let _ = i2c.write(M9N_ADDR, &enable_nav_pvt);
+
+        // Telling the GPS to enable the power to the antenna (technically shouldn't be needed but I was having issues)  
+        let enable_ant = [0xB5, 0x62, 0x06, 0x13, 0x04, 0x00, 0x1F, 0x00, 0xF0, 0x7D, 0xAB, 0x1F];
+        let _ = i2c.write(M9N_ADDR, &enable_ant);
+
+        // The parser that reads the data from I2C and interprets it as UBLOX packets
+        let parser = Parser::new(FixedLinearBuffer::new(cx.local.gps_raw_buffer));
+                
         // ---------------------------------------------------------------------------------
         
         // Returning our two structs
-        (Shared {}, Local { led, timer, usb_dev, serial, bme })
+        (Shared {}, Local { led, timer, usb_dev, serial, parser, i2c })
     }
 
 
@@ -153,28 +196,26 @@ mod app {
     // The thing above it is a flag that tells Rust what it will have in scope; currently we just have 
     // a local set of variables because we don't need any shared variables right now
     // It takes in a context, which is how you access all of the variables in local and shared.
-    #[idle(shared = [], local = [ led, timer, usb_dev, serial, bme ])]
+    #[idle(shared = [], local = [ led, timer, usb_dev, serial, parser, i2c ])]
     fn idle(cx: idle::Context) -> ! {
 
         // This is a simple last time timer implementation
         let mut last_send = cx.local.timer.get_counter();
 
         // The interval that we are waiting on to send a heartbeat
-        let interval = fugit::MicrosDurationU64::micros(2_000_000);
+        let interval = fugit::MicrosDurationU64::micros(1_000_000);
+        // fugit::Duration::secs(2);
 
-        // This is what you can think of as the actual loop. 
+        // Just a counter that I wanted to only sometimes poll for the hardware condition
+        // it polls every 5 loops
+        let mut hw_poll_counter = 0;
+
         loop {
 
-            // Polling the usb device to see if we have anything extra to play with from the other device
+            // Polling for the 
             if cx.local.usb_dev.poll(&mut [cx.local.serial]) {
-
-                // If we do have stuff to play with, we create a buffer where the serial object can put the information in it
                 let mut buf = [0u8; 64];
-
-                // Now we try to read the buffer from the serial object
                 if let Ok(count) = cx.local.serial.read(&mut buf) {
-
-                    // Then we just iterate through the buffer to see if the key 'r' shows up in it in binary 
                     for &byte in &buf[..count] {
                         if byte == b'l' { 
                             let _ = cx.local.led.set_high(); 
@@ -191,30 +232,192 @@ mod app {
             let now = cx.local.timer.get_counter();
 
             // Checking to see if enough time has passed to send a heartbeat
-            if (now - last_send) >= interval {
 
-                // -----------------------------------Added Stuff-----------------------------------
+            // -----------------------------------Added Stuff-----------------------------------
 
-                // Taking the measurements
-                let measurements = cx.local.bme.measure(cx.local.timer).unwrap();
+            if now - last_send > interval {
 
-                // Creating the message string (make sure this isn't too small, if you do it just straight up panics)
-                let mut message: String<128> = String::new();
-                write!(message, "Humidity: {}%\n\rTemperature: {} deg C\n\rPressure: {} pascals\n\r", measurements.humidity, measurements.temperature, measurements.pressure).unwrap();
+                let mut length_bytes = [0u8; 2];
+                if cx.local.i2c.write_read(M9N_ADDR, &[0xFD], &mut length_bytes).is_ok() {
+                    let bytes_available = u16::from_be_bytes(length_bytes) as usize;
 
-                // Writing it 
-                let _ = cx.local.serial.write(message.as_bytes());
-                
+                    let mut msg = String::<64>::new();
+                    let _ = write!(msg, "We got {} bytes\r\n", bytes_available);
+                    // let _ = cx.local.serial.write(msg.as_bytes());
 
-                // -----------------------------------End Added Stuff-----------------------------------
+                    let mut total_to_read = bytes_available;
 
-                // let _ = cx.local.serial.write(b"Connected and looping\r\n");
+
+                    while total_to_read > 0 {
+                        let mut data_chunk = [0u8; 64]; 
+                        let to_read = core::cmp::min(total_to_read, data_chunk.len());
+                                
+                        if cx.local.i2c.write_read(M9N_ADDR, &[0xFF], &mut data_chunk[..to_read]).is_ok() {
+                            let mut it = cx.local.parser.consume_ubx(&data_chunk[..to_read]);
+                            while let Some(packet_result) = it.next() {
+                                if let Ok(packet) = packet_result {
+                                    if let UbxPacket::Proto23(p) = packet {
+                                        let (class, id) = p.class_and_msg_id();
+                                        
+                                        match p {
+                                                // Specifically catch the NavPvt packet even if it's "Empty"
+                                                PacketRef::NavPvt(nav_pvt) => {
+                                                    let mut s = String::<128>::new();
+                                                    // Use standard formatting for protocol 14
+                                                    let _ = write!(s, "Fix: {:?} | Sats: {} | Local: ({},{}) | Acc: {}\r\n", 
+                                                        nav_pvt.fix_type(), 
+                                                        nav_pvt.num_satellites(),
+                                                        nav_pvt.longitude(),
+                                                        nav_pvt.latitude(),
+                                                        nav_pvt.horizontal_accuracy() // If this is 4294967295, the antenna is likely disconnected/unpowered
+                                                    );
+                                                    let _ = cx.local.serial.write(s.as_bytes());
+                                                    s = String::<128>::new();
+                                                    // Use standard formatting for protocol 1
+                                                    let _ = write!(s, "{} {}, {} {}:{}:{}\r\n", 
+                                                        nav_pvt.year(), 
+                                                        nav_pvt.month(),
+                                                        nav_pvt.day(),
+                                                        nav_pvt.hour(),
+                                                        nav_pvt.min(),
+                                                        nav_pvt.sec(),
+                                                    );
+                                                    let _ = cx.local.serial.write(s.as_bytes());
+                                                },
+                                                // Add NavStatus (0x01, 0x03) as a backup to see if hardware is healthy
+                                                PacketRef::NavStatus(status) => {
+                                                    let mut s = String::<64>::new();
+                                                    let _ = write!(s, "NavStatus: {:?} | Flags: 0x{:02X}\r\n", 
+                                                        status.itow(), 
+                                                        status.flags()
+                                                    );
+                                                    let _ = cx.local.serial.write(s.as_bytes());
+                                                },
+                                                PacketRef::Unknown(unknownPacket) =>  {
+                                                    let mut s = String::<128>::new();
+                                                    // Use standard formatting for protocol 14
+                                                    let _ = write!(s, "We got an unknown packet type)\r\n");
+                                                    let _ = cx.local.serial.write(s.as_bytes());
+                                                },
+                                                PacketRef::MonHw(hw) => {
+                                                    let mut s = String::<128>::new();
+                                                    let _ = write!(s, "Noise: {} | AGC: {}% | AntStatus: {:?}\r\n", 
+                                                        hw.noise_per_ms(), 
+                                                        (hw.agc_cnt() as u32 * 100) / 8191, // Gain control level
+                                                        hw.a_status()
+                                                    );
+                                                    let _ = cx.local.serial.write(s.as_bytes());
+
+                                                    if hw.noise_per_ms() <= 90 {
+                                                        cx.local.serial.write(b"In the green zone! Lock should be made soon!\r\n");
+                                                    }
+                                                },
+                                                _ => {
+                                                    let mut s = String::<128>::new();
+                                                    // Use standard formatting for protocol 14
+                                                    let _ = write!(s, "We didn't catch the right packet type.\r\n");
+                                                    let _ = cx.local.serial.write(s.as_bytes());
+                                                    let (class, id) = p.class_and_msg_id();
+                                                    if class == 0x0A && id == 0x09 {
+                                                        let mut s = String::<64>::new();
+                                                        let _ = write!(s, "FOUND MON-HW! Len: {}\r\n", p.payload_len());
+                                                        let _ = cx.local.serial.write(s.as_bytes());
+
+                                                        // You need this trait to enable the .payload() method on 'packet'
+                                                        // let payload = packet.payload(); 
+                                                        
+                                                        // if payload.len() >= 44 {
+                                                        //     // Offset 16 is 'noisePerMS' in the MON-HW structure
+                                                        //     let noise = payload[16]; 
+                                                        //     let mut n = String::<64>::new();
+                                                        //     let _ = write!(n, "Hardware Noise Level: {}\r\n", noise);
+                                                        //     let _ = cx.local.serial.write(n.as_bytes());
+                                                            
+                                                        //     // Offset 20 is 'aStatus' (Antenna Status)
+                                                        //     let ant_status = payload[20];
+                                                        //     let mut a = String::<64>::new();
+                                                        //     let _ = write!(a, "Antenna Status Code: {}\r\n", ant_status);
+                                                        //     let _ = cx.local.serial.write(a.as_bytes());
+                                                        // }
+                                                    }
+                                                    // Manual match if the enum variant is failing
+                                                    if class == 0x01 && id == 0x07 {
+                                                        let mut s = String::<128>::new();
+                                                        let _ = cx.local.serial.write(b"Caught NAV-PVT by ID!\r\n");
+                                                        
+                                                        // Try to force cast it to see if the data is readable
+                                                        if let PacketRef::NavPvt(nav) = p {
+                                                            let _ = write!(s, "Sats: {} | Fix: {:?}\r\n", nav.num_satellites(), nav.fix_type());
+                                                            let _ = cx.local.serial.write(s.as_bytes());
+                                                        } else {
+                                                            let _ = cx.local.serial.write(b"Enum mismatch, but ID is correct. Check Cargo.toml features!\r\n");
+                                                        }
+                                                    } else {
+                                                        let (class, id) = p.class_and_msg_id();
+                                                        let mut debug_msg = String::<64>::new();
+                                                        let _ = write!(debug_msg, "ID Match Fail: Class 0x{:02X}, ID 0x{:02X}\r\n", class, id);
+                                                        let _ = cx.local.serial.write(debug_msg.as_bytes());
+                                                    }
+                                                
+                                                },
+                                        };
+                                    }
+                                }
+                            }
+                        }
+                        total_to_read -= to_read;
+                    }
+                } else {
+                    let _ = cx.local.serial.write(b"Didn't get a message back on the i2c request\r\n");
+                    let mut debug_msg = String::<64>::new();
+                    let _ = write!(debug_msg, "Still has {} bytes\r\n", cx.local.parser.buffer_len());
+                    let _ = cx.local.serial.write(debug_msg.as_bytes());
+                }
+
+                let mon_ver_poll = [
+                    0xB5, 0x62, // Sync chars
+                    0x0A, 0x04, // Class (MON) and ID (VER)
+                    0x00, 0x00, // Length (0 bytes for a poll)
+                    0x0E, 0x34, // Pre-calculated Checksum for MON-VER poll
+                ];
+
+                // // 2. Write it to the GPS over I2C
+                // // We write to the default 'stream' register 0xFF or just the address
+                // if cx.local.i2c.write(M9N_ADDR, &mon_ver_poll).is_ok() {
+                //     let _ = cx.local.serial.write(b"Polled MonVer...\r\n");
+                // }
+
+                let mon_hw_poll = [
+                    0xB5, 0x62, // Sync
+                    0x0A, 0x09, // Class 0x0A (MON), ID 0x09 (HW)
+                    0x00, 0x00, // Length 0
+                    0x13, 0x43  // Checksum
+                ];
+                hw_poll_counter += 1;
+                if hw_poll_counter >= 5 {
+                    let mon_hw_poll = [0xB5, 0x62, 0x0A, 0x09, 0x00, 0x00, 0x13, 0x43]; // Correct Checksum
+                    let _ = cx.local.i2c.write(M9N_ADDR, &mon_hw_poll);
+                    hw_poll_counter = 0;
+                }
+
                 last_send = now;
+
             }
+
+            cx.local.timer.delay_ms(10);
+
+            // -----------------------------------End Added Stuff-----------------------------------
+
+            // let _ = cx.local.serial.write(b"Connected and looping\r\n");
 
             // Putting the CPU to sleed until the next interrupt (Good practice, but we won't be doing it right now)
             // cortex_m::asm::wfi(); 
+
         }
     }
 
 }
+
+
+
+

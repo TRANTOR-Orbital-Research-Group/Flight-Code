@@ -43,3 +43,7 @@ log = "0.4"
 # Fast Universal General-purpose Interval and Time (it's a crate for time and things)
 fugit = "0.3.9"
 bme280 = "0.5.1"
+
+# For the GPS
+# ublox = { version = "0.9", default-features = false, features = ["ubx_proto14"]} # For testing with the m8q
+ublox = { version = "0.9", default-features = false, features = ["ubx_proto23"]} # for testing with the m9n
