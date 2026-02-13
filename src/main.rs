@@ -96,6 +96,9 @@ fn main() -> ! {
     // Creating a Serial port on top of the usb bus
     let mut serial = SerialPort::new(&usb_bus);
 
+    //Set the LED Pin
+    let mut led_pin = pins.gpio25.into_push_pull_output();
+
     // Creating the device based on the serial port based on the usb bus
     let mut usb_dev = UsbDeviceBuilder::new(&usb_bus, UsbVidPid(0x16c0, 0x27dd))
         .strings(&[StringDescriptors::default()
@@ -107,14 +110,14 @@ fn main() -> ! {
         .build();
 
     //Give USB device time to initialize before use
-    for _ in 0..50_000 {
+    for _ in 0..150_000 {
         usb_dev.poll(&mut [&mut serial]);
     }
 
-    let spi_cs = pins.gpio1.into_push_pull_output();
-    let spi_sck = pins.gpio2.into_function::<hal::gpio::FunctionSpi>();
-    let spi_mosi = pins.gpio3.into_function::<hal::gpio::FunctionSpi>();
-    let spi_miso = pins.gpio4.into_function::<hal::gpio::FunctionSpi>();
+    let spi_cs = pins.gpio17.into_push_pull_output();
+    let spi_sck = pins.gpio18.into_function::<hal::gpio::FunctionSpi>();
+    let spi_mosi = pins.gpio19.into_function::<hal::gpio::FunctionSpi>();
+    let spi_miso = pins.gpio16.into_function::<hal::gpio::FunctionSpi>();
     let spi_bus = hal::spi::Spi::<_, _, _, 8>::new(pac.SPI0, (spi_mosi, spi_miso, spi_sck));
 
     let spi = spi_bus.init(
@@ -129,11 +132,12 @@ fn main() -> ! {
 
     let sd_size = sdcard.num_bytes();
 
-    // Now the program hangs indefinitely on open, but the com port is readable
     let mut volume_mgr = VolumeManager::new(sdcard, DummyTimesource::default());
+    // Now the program hangs indefinitely on open, but the com port is readable. This specific line halts the program.
     let mut volume0 = volume_mgr
         .open_volume(VolumeIdx(0))
         .unwrap();
+    led_pin.set_high().unwrap(); //Turn on LED if the program reaches this point
 
     let mut root_dir = volume0.open_root_dir().expect("failed to open root dir");
 
