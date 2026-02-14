@@ -135,10 +135,10 @@ mod app {
         let pins = hal::gpio::Pins::new(cx.device.IO_BANK0, cx.device.PADS_BANK0, sio.gpio_bank0, &mut resets);
 
         // The led that we want to play with
-        let mut led = pins.gpio25.into_push_pull_output();
+        let led = pins.gpio25.into_push_pull_output();
 
         // The timer that we need in our Local struct for our idle task
-        let mut timer = hal::Timer::new_timer0(cx.device.TIMER0, &mut resets, &clocks);
+        let timer = hal::Timer::new_timer0(cx.device.TIMER0, &mut resets, &clocks);
 
         // Initializing the usb bus so that we can make a device that uses the bus for our Local struct
         let usb_bus_alloc = cx.local.usb_bus.insert(UsbBusAllocator::new(
@@ -169,7 +169,7 @@ mod app {
 
 
         
-        // Telling the GPS that we want the navagation packets
+        // Telling the GPS that we want the navigation packets
         let enable_nav_pvt = [
             0xB5, 0x62, 0x06, 0x01, 0x03, 0x00, 
             0x01, 0x07, 0x01,
@@ -212,7 +212,7 @@ mod app {
 
         loop {
 
-            // Polling for the 
+            // Polling for any response by the computer over Serial
             if cx.local.usb_dev.poll(&mut [cx.local.serial]) {
                 let mut buf = [0u8; 64];
                 if let Ok(count) = cx.local.serial.read(&mut buf) {
@@ -228,42 +228,55 @@ mod app {
                 }
             }
 
-            // The current time (get_counter is a lot like millis in cpp)
+            // Same as before to set up non-blocking
             let now = cx.local.timer.get_counter();
 
-            // Checking to see if enough time has passed to send a heartbeat
 
             // -----------------------------------Added Stuff-----------------------------------
 
             if now - last_send > interval {
 
+                // The two bytes that represent the length (we will send it as a buffer so that I2C can tell us how much data is being sent) 
                 let mut length_bytes = [0u8; 2];
+
+                // Telling the GPS that we want data and asking it how much it is ready to send
                 if cx.local.i2c.write_read(M9N_ADDR, &[0xFD], &mut length_bytes).is_ok() {
+
+                    // How much data it is ready to send
                     let bytes_available = u16::from_be_bytes(length_bytes) as usize;
 
-                    let mut msg = String::<64>::new();
-                    let _ = write!(msg, "We got {} bytes\r\n", bytes_available);
-                    // let _ = cx.local.serial.write(msg.as_bytes());
-
+                    // A running total of how many bytes we have left to read so we can iterate across them
                     let mut total_to_read = bytes_available;
 
-
+                    // Iterating over all of the bytes
                     while total_to_read > 0 {
+                        
+                        // Making sure that the maximum amount of data we get will still fit in our buffer
                         let mut data_chunk = [0u8; 64]; 
                         let to_read = core::cmp::min(total_to_read, data_chunk.len());
                                 
+                        // Asking for the information from the gps
                         if cx.local.i2c.write_read(M9N_ADDR, &[0xFF], &mut data_chunk[..to_read]).is_ok() {
+
+                            // Passing the stuff to the parser
                             let mut it = cx.local.parser.consume_ubx(&data_chunk[..to_read]);
+
+                            // Iterating through the data that the parser has to read the packets
                             while let Some(packet_result) = it.next() {
+
+                                // If we have a packet, we need to read it
                                 if let Ok(packet) = packet_result {
+
+                                    // Matching the protocol of the packet (this is technically not needed, but I was testing with a GPS that
+                                    // uses a different protocol than the M9N, so this might help prevent headaches later
                                     if let UbxPacket::Proto23(p) = packet {
-                                        let (class, id) = p.class_and_msg_id();
                                         
+                                        // Now that we know that we have the packet, we need to know which kind
                                         match p {
-                                                // Specifically catch the NavPvt packet even if it's "Empty"
+
+                                                // The NavPvt packet is the navagation packet we want
                                                 PacketRef::NavPvt(nav_pvt) => {
                                                     let mut s = String::<128>::new();
-                                                    // Use standard formatting for protocol 14
                                                     let _ = write!(s, "Fix: {:?} | Sats: {} | Local: ({},{}) | Acc: {}\r\n", 
                                                         nav_pvt.fix_type(), 
                                                         nav_pvt.num_satellites(),
@@ -273,7 +286,6 @@ mod app {
                                                     );
                                                     let _ = cx.local.serial.write(s.as_bytes());
                                                     s = String::<128>::new();
-                                                    // Use standard formatting for protocol 1
                                                     let _ = write!(s, "{} {}, {} {}:{}:{}\r\n", 
                                                         nav_pvt.year(), 
                                                         nav_pvt.month(),
@@ -284,7 +296,7 @@ mod app {
                                                     );
                                                     let _ = cx.local.serial.write(s.as_bytes());
                                                 },
-                                                // Add NavStatus (0x01, 0x03) as a backup to see if hardware is healthy
+                                                // This is a packet that says the status of the GPS, so like the status and any errors
                                                 PacketRef::NavStatus(status) => {
                                                     let mut s = String::<64>::new();
                                                     let _ = write!(s, "NavStatus: {:?} | Flags: 0x{:02X}\r\n", 
@@ -293,72 +305,33 @@ mod app {
                                                     );
                                                     let _ = cx.local.serial.write(s.as_bytes());
                                                 },
-                                                PacketRef::Unknown(unknownPacket) =>  {
+                                                // If there are any unknown packets, this is where we can catch them
+                                                // in my testing I didn't actually ever get one though
+                                                PacketRef::Unknown(_) =>  {
                                                     let mut s = String::<128>::new();
                                                     // Use standard formatting for protocol 14
                                                     let _ = write!(s, "We got an unknown packet type)\r\n");
                                                     let _ = cx.local.serial.write(s.as_bytes());
                                                 },
+                                                // This is the hardware status packet, you have to specifically request it 
+                                                // but you can use the noise to tell you how close you are to getting a lock
+                                                // Noise below 90 will quickly get a lock, slowly between 90 and 100, and rarely above 100
                                                 PacketRef::MonHw(hw) => {
                                                     let mut s = String::<128>::new();
                                                     let _ = write!(s, "Noise: {} | AGC: {}% | AntStatus: {:?}\r\n", 
                                                         hw.noise_per_ms(), 
-                                                        (hw.agc_cnt() as u32 * 100) / 8191, // Gain control level
+                                                        (hw.agc_cnt() as u32 * 100) / 8191, 
                                                         hw.a_status()
                                                     );
                                                     let _ = cx.local.serial.write(s.as_bytes());
-
-                                                    if hw.noise_per_ms() <= 90 {
-                                                        cx.local.serial.write(b"In the green zone! Lock should be made soon!\r\n");
-                                                    }
                                                 },
+                                                // The wildcard, so any other packet that we don't have accounted for 
                                                 _ => {
-                                                    let mut s = String::<128>::new();
-                                                    // Use standard formatting for protocol 14
-                                                    let _ = write!(s, "We didn't catch the right packet type.\r\n");
-                                                    let _ = cx.local.serial.write(s.as_bytes());
+                                                    // Printing out what the ID and class of the packet is 
                                                     let (class, id) = p.class_and_msg_id();
-                                                    if class == 0x0A && id == 0x09 {
-                                                        let mut s = String::<64>::new();
-                                                        let _ = write!(s, "FOUND MON-HW! Len: {}\r\n", p.payload_len());
-                                                        let _ = cx.local.serial.write(s.as_bytes());
-
-                                                        // You need this trait to enable the .payload() method on 'packet'
-                                                        // let payload = packet.payload(); 
-                                                        
-                                                        // if payload.len() >= 44 {
-                                                        //     // Offset 16 is 'noisePerMS' in the MON-HW structure
-                                                        //     let noise = payload[16]; 
-                                                        //     let mut n = String::<64>::new();
-                                                        //     let _ = write!(n, "Hardware Noise Level: {}\r\n", noise);
-                                                        //     let _ = cx.local.serial.write(n.as_bytes());
-                                                            
-                                                        //     // Offset 20 is 'aStatus' (Antenna Status)
-                                                        //     let ant_status = payload[20];
-                                                        //     let mut a = String::<64>::new();
-                                                        //     let _ = write!(a, "Antenna Status Code: {}\r\n", ant_status);
-                                                        //     let _ = cx.local.serial.write(a.as_bytes());
-                                                        // }
-                                                    }
-                                                    // Manual match if the enum variant is failing
-                                                    if class == 0x01 && id == 0x07 {
-                                                        let mut s = String::<128>::new();
-                                                        let _ = cx.local.serial.write(b"Caught NAV-PVT by ID!\r\n");
-                                                        
-                                                        // Try to force cast it to see if the data is readable
-                                                        if let PacketRef::NavPvt(nav) = p {
-                                                            let _ = write!(s, "Sats: {} | Fix: {:?}\r\n", nav.num_satellites(), nav.fix_type());
-                                                            let _ = cx.local.serial.write(s.as_bytes());
-                                                        } else {
-                                                            let _ = cx.local.serial.write(b"Enum mismatch, but ID is correct. Check Cargo.toml features!\r\n");
-                                                        }
-                                                    } else {
-                                                        let (class, id) = p.class_and_msg_id();
-                                                        let mut debug_msg = String::<64>::new();
-                                                        let _ = write!(debug_msg, "ID Match Fail: Class 0x{:02X}, ID 0x{:02X}\r\n", class, id);
-                                                        let _ = cx.local.serial.write(debug_msg.as_bytes());
-                                                    }
-                                                
+                                                    let mut debug_msg = String::<64>::new();
+                                                    let _ = write!(debug_msg, "Unimplemented packet recieved: Class 0x{:02X}, ID 0x{:02X}\r\n", class, id);
+                                                    let _ = cx.local.serial.write(debug_msg.as_bytes());
                                                 },
                                         };
                                     }
@@ -374,28 +347,10 @@ mod app {
                     let _ = cx.local.serial.write(debug_msg.as_bytes());
                 }
 
-                let mon_ver_poll = [
-                    0xB5, 0x62, // Sync chars
-                    0x0A, 0x04, // Class (MON) and ID (VER)
-                    0x00, 0x00, // Length (0 bytes for a poll)
-                    0x0E, 0x34, // Pre-calculated Checksum for MON-VER poll
-                ];
-
-                // // 2. Write it to the GPS over I2C
-                // // We write to the default 'stream' register 0xFF or just the address
-                // if cx.local.i2c.write(M9N_ADDR, &mon_ver_poll).is_ok() {
-                //     let _ = cx.local.serial.write(b"Polled MonVer...\r\n");
-                // }
-
-                let mon_hw_poll = [
-                    0xB5, 0x62, // Sync
-                    0x0A, 0x09, // Class 0x0A (MON), ID 0x09 (HW)
-                    0x00, 0x00, // Length 0
-                    0x13, 0x43  // Checksum
-                ];
+                // This is the logic for requesting a hardware info packet
                 hw_poll_counter += 1;
                 if hw_poll_counter >= 5 {
-                    let mon_hw_poll = [0xB5, 0x62, 0x0A, 0x09, 0x00, 0x00, 0x13, 0x43]; // Correct Checksum
+                    let mon_hw_poll = [0xB5, 0x62, 0x0A, 0x09, 0x00, 0x00, 0x13, 0x43];
                     let _ = cx.local.i2c.write(M9N_ADDR, &mon_hw_poll);
                     hw_poll_counter = 0;
                 }
@@ -408,9 +363,7 @@ mod app {
 
             // -----------------------------------End Added Stuff-----------------------------------
 
-            // let _ = cx.local.serial.write(b"Connected and looping\r\n");
-
-            // Putting the CPU to sleed until the next interrupt (Good practice, but we won't be doing it right now)
+            // Putting the CPU to sleep until the next interrupt (Good practice, but we won't be doing it right now)
             // cortex_m::asm::wfi(); 
 
         }
