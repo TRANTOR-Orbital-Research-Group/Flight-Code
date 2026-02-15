@@ -140,7 +140,7 @@ fn main() -> ! {
             loop
             {
                 let mut debug_message: String<128> = String::new();
-                let _ = write!(debug_message, "ERROR! {:?}\n", e);
+                let _ = write!(debug_message, "ERROR! {:?}\n\r", e);
                 let _ = serial.write(debug_message.as_bytes());
 
                 if usb_dev.poll(&mut [&mut serial]) {
@@ -155,7 +155,7 @@ fn main() -> ! {
                 }
             }
         }
-    }
+    };
 
     let mut volume_mgr = VolumeManager::new(sdcard, DummyTimesource::default());
     // Now the program hangs indefinitely on open, but the com port is readable. This specific line halts the program.
@@ -165,7 +165,7 @@ fn main() -> ! {
         Err(e) => {
             loop {
                 let mut debug_message: String<128> = String::new();
-                let _ = write!(debug_message, "ERROR! {:?}\n", e);
+                let _ = write!(debug_message, "ERROR! {:?}\n\r", e);
                 let _ = serial.write(debug_message.as_bytes());
 
                 if usb_dev.poll(&mut [&mut serial]) {
