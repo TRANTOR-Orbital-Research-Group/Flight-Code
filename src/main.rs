@@ -10,6 +10,9 @@ use defmt_rtt as _;
 use embedded_hal_bus::spi::ExclusiveDevice;
 use embedded_sdmmc::{SdCard, TimeSource, Timestamp, VolumeIdx, VolumeManager};
 use rp235x_hal::fugit::RateExtU32;
+use heapless::String;
+use core::fmt::Write;
+use rp235x_hal::reboot::{reboot, RebootKind, RebootArch};
 
 /// Tell the Boot ROM about our application
 #[unsafe(link_section = ".start_block")]
@@ -110,7 +113,7 @@ fn main() -> ! {
         .build();
 
     //Give USB device time to initialize before use
-    for _ in 0..150_000 {
+    for _ in 0..50_000 {
         usb_dev.poll(&mut [&mut serial]);
     }
 
@@ -134,9 +137,28 @@ fn main() -> ! {
 
     let mut volume_mgr = VolumeManager::new(sdcard, DummyTimesource::default());
     // Now the program hangs indefinitely on open, but the com port is readable. This specific line halts the program.
-    let mut volume0 = volume_mgr
-        .open_volume(VolumeIdx(0))
-        .unwrap();
+    let mut volume0 = match volume_mgr.open_volume(VolumeIdx(0))
+    {
+        Ok(vol) => vol,
+        Err(e) => {
+            loop {
+                let mut debug_message: String<128> = String::new();
+                let _ = write!(debug_message, "ERROR! {:?}", e);
+                let _ = serial.write(debug_message.as_bytes());
+
+                if usb_dev.poll(&mut [&mut serial]) {
+                    let mut buf = [0u8; 65];
+                    if let Ok(count) = serial.read(&mut buf) {
+                        for &byte in &buf[..count] {
+                            if byte == b'b' {
+                                reboot(RebootKind::BootSel {picoboot_disabled: false, msd_disabled: false}, RebootArch::Arm);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
     led_pin.set_high().unwrap(); //Turn on LED if the program reaches this point
 
     let mut root_dir = volume0.open_root_dir().expect("failed to open root dir");
