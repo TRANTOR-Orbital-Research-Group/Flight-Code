@@ -26,9 +26,6 @@ use usb_device::{class_prelude::*, prelude::*};
 // USB Communications Class Device support
 use usbd_serial::SerialPort;
 
-
-
-
 /// Code from https://github.com/rp-rs/rp-hal-boards/blob/main/boards/rp-pico/examples/pico_spi_sd_card.rs
 /// A dummy timesource, which is mostly important for creating files.
 #[derive(Default)]
@@ -49,6 +46,26 @@ impl TimeSource for DummyTimesource {
     }
 }
 
+fn hw_handle_err(e: Result::Error, mut serial: SerialPort<dyn UsbBus>, mut usb_dev: UsbDevice<dyn UsbBus>) -> !
+{
+    loop
+    {
+        let mut debug_message: String<128> = String::new();
+        let _ = write!(debug_message, "ERROR! {:?}\n\r", e);
+        let _ = serial.write(debug_message.as_bytes());
+
+        if usb_dev.poll(&mut [&mut serial]) {
+            let mut buf = [0u8; 65];
+            if let Ok(count) = serial.read(&mut buf) {
+                for &byte in &buf[..count] {
+                    if byte == b'b' {
+                        reboot(RebootKind::BootSel {picoboot_disabled: false, msd_disabled: false}, RebootArch::Arm);
+                    }
+                }
+            }
+        }
+    }
+}
 
 #[hal::entry]
 fn main() -> ! {
@@ -136,25 +153,7 @@ fn main() -> ! {
 
     let sd_size = match sdcard.num_bytes() {
         Ok(size) => size,
-        Err(e) => {
-            loop
-            {
-                let mut debug_message: String<128> = String::new();
-                let _ = write!(debug_message, "ERROR! {:?}\n\r", e);
-                let _ = serial.write(debug_message.as_bytes());
-
-                if usb_dev.poll(&mut [&mut serial]) {
-                    let mut buf = [0u8; 65];
-                    if let Ok(count) = serial.read(&mut buf) {
-                        for &byte in &buf[..count] {
-                            if byte == b'b' {
-                                reboot(RebootKind::BootSel {picoboot_disabled: false, msd_disabled: false}, RebootArch::Arm);
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        Err(e) => hw_handle_err(e, serial, usb_dev)
     };
 
     let mut volume_mgr = VolumeManager::new(sdcard, DummyTimesource::default());
@@ -162,24 +161,7 @@ fn main() -> ! {
     let mut volume0 = match volume_mgr.open_volume(VolumeIdx(0))
     {
         Ok(vol) => vol,
-        Err(e) => {
-            loop {
-                let mut debug_message: String<128> = String::new();
-                let _ = write!(debug_message, "ERROR! {:?}\n\r", e);
-                let _ = serial.write(debug_message.as_bytes());
-
-                if usb_dev.poll(&mut [&mut serial]) {
-                    let mut buf = [0u8; 65];
-                    if let Ok(count) = serial.read(&mut buf) {
-                        for &byte in &buf[..count] {
-                            if byte == b'b' {
-                                reboot(RebootKind::BootSel {picoboot_disabled: false, msd_disabled: false}, RebootArch::Arm);
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        Err(e) => hw_handle_err(e, serial, usb_dev)
     };
     led_pin.set_high().unwrap(); //Turn on LED if the program reaches this point
 
