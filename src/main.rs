@@ -133,7 +133,29 @@ fn main() -> ! {
 
     let sdcard = SdCard::new(spi, &mut timer_sd);
 
-    let sd_size = sdcard.num_bytes();
+
+    let sd_size = match sdcard.num_bytes() {
+        Ok(size) => size,
+        Err(e) => {
+            loop
+            {
+                let mut debug_message: String<128> = String::new();
+                let _ = write!(debug_message, "ERROR! {:?}\n", e);
+                let _ = serial.write(debug_message.as_bytes());
+
+                if usb_dev.poll(&mut [&mut serial]) {
+                    let mut buf = [0u8; 65];
+                    if let Ok(count) = serial.read(&mut buf) {
+                        for &byte in &buf[..count] {
+                            if byte == b'b' {
+                                reboot(RebootKind::BootSel {picoboot_disabled: false, msd_disabled: false}, RebootArch::Arm);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     let mut volume_mgr = VolumeManager::new(sdcard, DummyTimesource::default());
     // Now the program hangs indefinitely on open, but the com port is readable. This specific line halts the program.
@@ -143,7 +165,7 @@ fn main() -> ! {
         Err(e) => {
             loop {
                 let mut debug_message: String<128> = String::new();
-                let _ = write!(debug_message, "ERROR! {:?}", e);
+                let _ = write!(debug_message, "ERROR! {:?}\n", e);
                 let _ = serial.write(debug_message.as_bytes());
 
                 if usb_dev.poll(&mut [&mut serial]) {
