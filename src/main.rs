@@ -13,6 +13,8 @@ use rp235x_hal::fugit::RateExtU32;
 use heapless::String;
 use core::fmt::Write;
 use rp235x_hal::reboot::{reboot, RebootKind, RebootArch};
+use embedded_hal::spi::SpiBus;
+use embedded_sdmmc::BlockDevice;
 
 /// Tell the Boot ROM about our application
 #[unsafe(link_section = ".start_block")]
@@ -25,6 +27,9 @@ const XTAL_FREQ_HZ: u32 = 12_000_000u32;
 use usb_device::{class_prelude::*, prelude::*};
 // USB Communications Class Device support
 use usbd_serial::SerialPort;
+
+
+
 
 /// Code from https://github.com/rp-rs/rp-hal-boards/blob/main/boards/rp-pico/examples/pico_spi_sd_card.rs
 /// A dummy timesource, which is mostly important for creating files.
@@ -46,26 +51,6 @@ impl TimeSource for DummyTimesource {
     }
 }
 
-// fn hw_handle_err(e: Result::Error, mut serial: SerialPort<'static, hal::usb::UsbBus>, mut usb_dev: UsbDevice<'static, hal::usb::UsbBus>) -> !
-// {
-//     loop
-//     {
-//         let mut debug_message: String<128> = String::new();
-//         let _ = write!(debug_message, "ERROR! {:?}\n\r", e);
-//         let _ = serial.write(debug_message.as_bytes());
-//
-//         if usb_dev.poll(&mut [&mut serial]) {
-//             let mut buf = [0u8; 65];
-//             if let Ok(count) = serial.read(&mut buf) {
-//                 for &byte in &buf[..count] {
-//                     if byte == b'b' {
-//                         reboot(RebootKind::BootSel {picoboot_disabled: false, msd_disabled: false}, RebootArch::Arm);
-//                     }
-//                 }
-//             }
-//         }
-//     }
-// }
 
 #[hal::entry]
 fn main() -> ! {
@@ -102,7 +87,8 @@ fn main() -> ! {
     );
 
     let mut timer = hal::Timer::new_timer0(pac.TIMER0, &mut pac.RESETS, &clocks);
-    let mut timer_sd = timer;
+    let mut timer_sd = timer.clone();
+    let timer_nonblocking = timer.clone();
 
     // Creating a usb bus to use
     let usb_bus = UsbBusAllocator::new(hal::usb::UsbBus::new(
@@ -115,6 +101,7 @@ fn main() -> ! {
 
     // Creating a Serial port on top of the usb bus
     let mut serial = SerialPort::new(&usb_bus);
+
 
     //Set the LED Pin
     let mut led_pin = pins.gpio25.into_push_pull_output();
@@ -129,16 +116,27 @@ fn main() -> ! {
         .device_class(2) // 2 for the CDC, from: https://www.usb.org/defined-class-codes
         .build();
 
-    //Give USB device time to initialize before use
-    for _ in 0..50_000 {
+    // Waiting for the usb initialize and connect to the computer
+    loop {
         usb_dev.poll(&mut [&mut serial]);
+        if serial.dtr() {
+            break; 
+        }
     }
 
-    let spi_cs = pins.gpio17.into_push_pull_output();
+    let _ = serial.write(b"Beginning the SD creation stuff...\n\r");
+
+    let spi_miso = pins.gpio16
+    .into_pull_up_input()
+    .into_function::<hal::gpio::FunctionSpi>();
+
+    let mut spi_cs = pins.gpio17.into_push_pull_output();
     let spi_sck = pins.gpio18.into_function::<hal::gpio::FunctionSpi>();
     let spi_mosi = pins.gpio19.into_function::<hal::gpio::FunctionSpi>();
-    let spi_miso = pins.gpio16.into_function::<hal::gpio::FunctionSpi>();
     let spi_bus = hal::spi::Spi::<_, _, _, 8>::new(pac.SPI0, (spi_mosi, spi_miso, spi_sck));
+
+    let _ = serial.write(b"Created spi_bus.\n\r");
+
 
     let spi = spi_bus.init(
         &mut pac.RESETS,
@@ -146,36 +144,55 @@ fn main() -> ! {
         400.kHz(), // card initialization happens at low baud rate
         embedded_hal::spi::MODE_0,
     );
+
+    spi_cs.set_high().unwrap();
+    
+    
     let spi = ExclusiveDevice::new(spi, spi_cs, &mut timer).unwrap();
+    
+    let _ = serial.write(b"Created spi.\n\r");
+    
 
     let sdcard = SdCard::new(spi, &mut timer_sd);
 
+    let _ = serial.write(b"Created sdcard.\n\r");
+    
 
-    let sd_size = match sdcard.num_bytes() {
-        Ok(size) => size,
-        Err(e) => {
-                loop
-                {
-                    let mut debug_message: String<128> = String::new();
-                    let _ = write!(debug_message, "ERROR! {:?}\n\r", e);
-                    let _ = serial.write(debug_message.as_bytes());
+    // let blocks = sdcard.num_blocks();
+    let bytes = match sdcard.num_bytes() {
+        Ok(num) => num,
+        Err(error) => {
+            let mut last_time = timer_nonblocking.get_counter();
+            let mut buf = [0u8; 8];
+            loop {
+                usb_dev.poll(&mut [&mut serial]);
+                if (timer_nonblocking.get_counter() - last_time).to_millis() > 2000 {
+                    let mut err_msg: String<64> = String::new();
+                    let _ = write!(err_msg, "Currently Erroring: {:?}\r\n", error);
+                    let _ = serial.write(err_msg.as_bytes());
+                    last_time = timer_nonblocking.get_counter();
 
-                    if usb_dev.poll(&mut [&mut serial]) {
-                        let mut buf = [0u8; 65];
-                        if let Ok(count) = serial.read(&mut buf) {
-                            for &byte in &buf[..count] {
-                                if byte == b'b' {
-                                    reboot(RebootKind::BootSel {picoboot_disabled: false, msd_disabled: false}, RebootArch::Arm);
-                                }
-                            }
-                        }
+                }
+                if let Ok(count) = serial.read(&mut buf) {
+                    if buf[..count].contains(&b'b') {
+                        reboot(RebootKind::BootSel {picoboot_disabled: false, msd_disabled: false}, RebootArch::Arm);
                     }
                 }
-            }
-    };
 
+            }
+        }
+    };
+    let mut msg: String<128> = String::new();
+    let _ = write!(msg, "Found the size of the SD card: {} bytes or {} gigabytes\r\n", bytes, bytes as f32 /1_000_000_000f32);
+    let _ = serial.write(msg.as_bytes());
+
+    
     let mut volume_mgr = VolumeManager::new(sdcard, DummyTimesource::default());
-    // Now the program hangs indefinitely on open, but the com port is readable. This specific line halts the program.
+
+
+    let _ = serial.write(b"Starting volume making");
+
+
     let mut volume0 = match volume_mgr.open_volume(VolumeIdx(0))
     {
         Ok(vol) => vol,
@@ -199,13 +216,47 @@ fn main() -> ! {
             }
         }
     };
-    led_pin.set_high().unwrap(); //Turn on LED if the program reaches this point
+
+    let mut msg: String<64> = String::new();
+    let _ = write!(msg, "Created volume0.\r\n");
+    let _ = serial.write(msg.as_bytes());
 
     let mut root_dir = volume0.open_root_dir().expect("failed to open root dir");
 
-    let mut my_file = root_dir
-        .open_file_in_dir("RUST.TXT", embedded_sdmmc::Mode::ReadOnly)
-        .expect("failed to open RUST.TXT file");
+    let mut msg: String<64> = String::new();
+    let _ = write!(msg, "Opened root directiory.\r\n");
+    let _ = serial.write(msg.as_bytes());
+
+    let mut my_file = match root_dir.open_file_in_dir("RUST.TXT", embedded_sdmmc::Mode::ReadOnly) {
+            Ok(file) => file,
+            Err(error) => {
+                let mut last_time = timer_nonblocking.get_counter();
+                let mut buf = [0u8; 8];
+                loop {
+                    usb_dev.poll(&mut [&mut serial]);
+                    if (timer_nonblocking.get_counter() - last_time).to_millis() > 2000 {
+                        let mut err_msg: String<64> = String::new();
+                        let _ = write!(err_msg, "Currently Erroring: {:?}\r\n", error);
+                        let _ = serial.write(err_msg.as_bytes());
+                        last_time = timer_nonblocking.get_counter();
+
+                    }
+                    if let Ok(count) = serial.read(&mut buf) {
+                        if buf[..count].contains(&b'b') {
+                            reboot(RebootKind::BootSel {picoboot_disabled: false, msd_disabled: false}, RebootArch::Arm);
+                        }
+                    }
+
+                }
+            }
+        };
+
+    let mut msg: String<64> = String::new();
+    let _ = write!(msg, "Opened Rust.txt.\r\n");
+    let _ = serial.write(msg.as_bytes());
+
+    // Settting the led high so that we know that it sucessfully read
+    led_pin.set_high().unwrap();
 
     let mut ticks = 0;
 
@@ -218,7 +269,7 @@ fn main() -> ! {
         // Responding if it hasn't said hello
         if ticks > 1_000_000 {
             // Writes bytes from `data` into the port and returns the number of bytes written.
-            let _ = serial.write(b"Hello, Rust!\r\n");
+            let _ = serial.write(b"Looping!\r\n");
             ticks -= 1_000_000;
         }
 
