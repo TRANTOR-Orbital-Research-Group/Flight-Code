@@ -1,5 +1,8 @@
-#![no_std]
-#![no_main]
+/* 
+ * 
+ * Attempting to get the BME280 working with the pico.
+ * 
+ */
 
 use rp235x_hal as hal;
 use hal::block::ImageDef;
