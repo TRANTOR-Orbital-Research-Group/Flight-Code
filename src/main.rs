@@ -7,7 +7,6 @@
 
 #![no_std]
 #![no_main]
-
 use rp235x_hal::{self as hal, gpio::Pins, i2c::I2C, Sio, Timer};
 use {panic_probe as _};
 use embedded_hal::digital::OutputPin;
@@ -16,7 +15,6 @@ use rp235x_hal::reboot::{reboot, RebootKind, RebootArch};
 use fugit::RateExtU32;
 use heapless::String;
 use core::fmt::Write;
-
 
 // Tells the Rust where to put the actual image (I think) 
 use hal::block::ImageDef;
@@ -31,8 +29,8 @@ pub static IMAGE_DEF: ImageDef = hal::block::ImageDef::secure_exe();
 #[rtic::app(device = hal::pac, dispatchers = [UART0_IRQ])]
 mod app {
     use super::*;
-    use bme280::i2c::BME280;
-    use rp235x_hal::{pac::{I2C0, otp_data::key1_3}, timer::CopyableTimer0};
+    use bno055::Bno055;
+    use rp235x_hal::{pac::{I2C1}};
     use usb_device::{class_prelude::*, prelude::*};
     use usbd_serial::SerialPort;
 
@@ -50,27 +48,10 @@ mod app {
         timer: hal::Timer<hal::timer::CopyableTimer0>,
         usb_dev: UsbDevice<'static, hal::usb::UsbBus>,
         serial: SerialPort<'static, hal::usb::UsbBus>,
-
-        // I apologize profusely because of how horrible this looks
-        // We should be able to make a type out of this later for readability though
-        bme: BME280<
-            rp235x_hal::I2C<
-                rp235x_hal::pac::I2C1,
-                (
-                    rp235x_hal::gpio::Pin<
-                        rp235x_hal::gpio::bank0::Gpio18,
-                        rp235x_hal::gpio::FunctionI2c,
-                        rp235x_hal::gpio::PullUp,
-                    >,
-                    rp235x_hal::gpio::Pin<
-                        rp235x_hal::gpio::bank0::Gpio19,
-                        rp235x_hal::gpio::FunctionI2c,
-                        rp235x_hal::gpio::PullUp,
-                    >,
-                ),
-            >
-        >,
-
+        bno: Bno055<I2C<I2C1, (
+            rp235x_hal::gpio::Pin<rp235x_hal::gpio::bank0::Gpio18,rp235x_hal::gpio::FunctionI2c, rp235x_hal::gpio::PullUp>,
+            rp235x_hal::gpio::Pin<rp235x_hal::gpio::bank0::Gpio19,rp235x_hal::gpio::FunctionI2c, rp235x_hal::gpio::PullUp>
+        )>>
     }
 
 
@@ -78,6 +59,9 @@ mod app {
     // Note that it creates the Shared and Local structs that our tasks get to use
     #[init(local = [usb_bus: Option<UsbBusAllocator<hal::usb::UsbBus>> = None])]
     fn init(cx: init::Context) -> (Shared, Local) {
+
+        //String buffer for error messages
+        let mut debug_buff: String<64> = String::new();
 
         // All of the peripherals are off when the pico powers on, so we need the resets controller to be able to turn them on
         // That is what this is
@@ -116,16 +100,22 @@ mod app {
         ));
 
         // Creating a serial port on the bus
-        let serial = SerialPort::new(usb_bus_alloc);
+        let mut serial = SerialPort::new(usb_bus_alloc);
 
         // Creating a serial device that uses that port and that bus
-        let usb_dev = UsbDeviceBuilder::new(usb_bus_alloc, UsbVidPid(0x16c0, 0x27dd))
+        let mut usb_dev = UsbDeviceBuilder::new(usb_bus_alloc, UsbVidPid(0x16c0, 0x27dd))
             .strings(&[StringDescriptors::default().product("RTIC Serial")])
             .unwrap()
             .device_class(2)
             .build();
 
-        // -----------------------------------Added Stuff-----------------------------------
+        // Waiting for the usb initialize and connect to the computer
+        loop {
+            usb_dev.poll(&mut [&mut serial]);
+            if serial.dtr() {
+                break;
+            }
+        }
 
         // Creating a new i2c bus on pins 18 and 19
         let i2c = I2C::i2c1(
@@ -137,23 +127,27 @@ mod app {
                 125_000_000.Hz(),
         );
 
-        // Creating the BME
-        let mut bme = BME280::new_secondary(i2c);
-        bme.init(&mut timer).unwrap();
+        let mut bno = Bno055::new(i2c);
+        match (bno.init(&mut timer)) {
+            Ok(b) => b,
+            Err(e) => {
+                write!(debug_buff, "Error: {:?}\n\r", e).unwrap();
+                serial.write(debug_buff.as_bytes()).unwrap();
+                loop{}
+            }
+        };
 
         // ---------------------------------------------------------------------------------
         
         // Returning our two structs
-        (Shared {}, Local { led, timer, usb_dev, serial, bme })
+        (Shared {}, Local { led, timer, usb_dev, serial, bno })
     }
-
-
 
     // This is the idle loop. The idle loop is the basically the `void loop()` part of C++ Arduino
     // The thing above it is a flag that tells Rust what it will have in scope; currently we just have 
     // a local set of variables because we don't need any shared variables right now
     // It takes in a context, which is how you access all of the variables in local and shared.
-    #[idle(shared = [], local = [ led, timer, usb_dev, serial, bme ])]
+    #[idle(shared = [], local = [ led, timer, usb_dev, serial, bno ])]
     fn idle(cx: idle::Context) -> ! {
 
         // This is a simple last time timer implementation
@@ -162,8 +156,21 @@ mod app {
         // The interval that we are waiting on to send a heartbeat
         let interval = fugit::MicrosDurationU64::micros(2_000_000);
 
+        //String buffer for error messages
+        let mut debug_buff: String<64> = String::new();
+
         // This is what you can think of as the actual loop. 
         loop {
+
+            //Get bno readings
+            let gyro = match (cx.local.bno.gyro_data()) {
+                Ok(d) => d,
+                Err(e) => {
+                    write!(debug_buff, "Error: {:?} \n\r", e).unwrap();
+                    cx.local.serial.write(debug_buff.as_bytes()).unwrap();
+                    loop{}
+                }
+            };
 
             // Polling the usb device to see if we have anything extra to play with from the other device
             if cx.local.usb_dev.poll(&mut [cx.local.serial]) {
@@ -193,27 +200,16 @@ mod app {
             // Checking to see if enough time has passed to send a heartbeat
             if (now - last_send) >= interval {
 
-                // -----------------------------------Added Stuff-----------------------------------
-
-                // Taking the measurements
-                let measurements = cx.local.bme.measure(cx.local.timer).unwrap();
-
-                // Creating the message string (make sure this isn't too small, if you do it just straight up panics)
                 let mut message: String<128> = String::new();
-                write!(message, "Humidity: {}%\n\rTemperature: {} deg C\n\rPressure: {} pascals\n\r", measurements.humidity, measurements.temperature, measurements.pressure).unwrap();
+                write!(message,"Gyro:\n\r x: {}\n\ry: {}\n\rz: {}\n\r", gyro.x, gyro.y, gyro.z).unwrap();
 
-                // Writing it 
                 let _ = cx.local.serial.write(message.as_bytes());
-                
-
-                // -----------------------------------End Added Stuff-----------------------------------
-
-                // let _ = cx.local.serial.write(b"Connected and looping\r\n");
                 last_send = now;
             }
 
-            // Putting the CPU to sleed until the next interrupt (Good practice, but we won't be doing it right now)
-            // cortex_m::asm::wfi(); 
+            // Putting the CPU to sleep until the next interrupt (Good practice, but we won't be doing it right now)
+            // cortex_m::asm::wfi();
+            debug_buff.clear();
         }
     }
 
