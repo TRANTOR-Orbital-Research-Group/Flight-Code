@@ -1,12 +1,6 @@
-/* 
- * 
- * Attempting to get the BME280 working with the pico.
- * 
- */
-
-
 #![no_std]
 #![no_main]
+
 use rp235x_hal::{self as hal, gpio::Pins, i2c::I2C, Sio, Timer};
 use {panic_probe as _};
 use embedded_hal::digital::OutputPin;
@@ -22,6 +16,7 @@ use hal::block::ImageDef;
 #[used]
 pub static IMAGE_DEF: ImageDef = hal::block::ImageDef::secure_exe();
 
+
 // This is where the actual RTIC application starts. We see the device as our hal's peripheral access crate and the dispacter,
 // which is the interrupt vector for the software tasks. This means that all of our software interrupts use the UART0_IRQ interrupt vector
 // which means that they all have a priority 2 for RTIC. We can (and likely will) add more dispatchers later so that we can have different 
@@ -29,7 +24,7 @@ pub static IMAGE_DEF: ImageDef = hal::block::ImageDef::secure_exe();
 #[rtic::app(device = hal::pac, dispatchers = [UART0_IRQ])]
 mod app {
     use super::*;
-    use bno055::Bno055;
+    use bno055::{BNO055OperationMode, Bno055};
     use rp235x_hal::{pac::{I2C1}};
     use usb_device::{class_prelude::*, prelude::*};
     use usbd_serial::SerialPort;
@@ -54,14 +49,10 @@ mod app {
         )>>
     }
 
-
     // This is the init task, which is a lot like the `void setup()` function in Arduino cpp
     // Note that it creates the Shared and Local structs that our tasks get to use
     #[init(local = [usb_bus: Option<UsbBusAllocator<hal::usb::UsbBus>> = None])]
     fn init(cx: init::Context) -> (Shared, Local) {
-
-        //String buffer for error messages
-        let mut debug_buff: String<64> = String::new();
 
         // All of the peripherals are off when the pico powers on, so we need the resets controller to be able to turn them on
         // That is what this is
@@ -109,45 +100,43 @@ mod app {
             .device_class(2)
             .build();
 
-        // Waiting for the usb initialize and connect to the computer
-        loop {
-            usb_dev.poll(&mut [&mut serial]);
-            if serial.dtr() {
-                break;
-            }
-        }
+        //Waiting for the usb initialize and connect to the computer
+        // while !serial.dtr() {
+        //     usb_dev.poll(&mut [&mut serial]);
+        // }
 
-        // Creating a new i2c bus on pins 18 and 19
+        //Creating a new i2c bus on pins 18 and 19
         let i2c = I2C::i2c1(
-                cx.device.I2C1,
-                pins.gpio18.reconfigure(), // sda
-                pins.gpio19.reconfigure(), // scl
-                400.kHz(),
-                &mut resets,
-                125_000_000.Hz(),
+            cx.device.I2C1,
+            pins.gpio18.reconfigure(), // sda
+            pins.gpio19.reconfigure(), // scl
+            400.kHz(),
+            &mut resets,
+            125_000_000.Hz(),
         );
 
         let mut bno = Bno055::new(i2c);
-        match (bno.init(&mut timer)) {
-            Ok(b) => b,
-            Err(e) => {
-                write!(debug_buff, "Error: {:?}\n\r", e).unwrap();
-                serial.write(debug_buff.as_bytes()).unwrap();
-                loop{}
-            }
-        };
-
-        // ---------------------------------------------------------------------------------
+        let _ = bno.init(&mut timer);
+        // match bno.init(&mut timer) {
+        //     Ok(b) => b,
+        //     Err(_) => {
+        //         let _ = serial.write(b"Error initializing the BNO\r\n");
+        //         loop{}
+        //     }
+        // };
+        //let _ = bno.set_mode(BNO055OperationMode::NDOF, &mut timer);
         
         // Returning our two structs
         (Shared {}, Local { led, timer, usb_dev, serial, bno })
     }
 
+
+
     // This is the idle loop. The idle loop is the basically the `void loop()` part of C++ Arduino
     // The thing above it is a flag that tells Rust what it will have in scope; currently we just have 
     // a local set of variables because we don't need any shared variables right now
     // It takes in a context, which is how you access all of the variables in local and shared.
-    #[idle(shared = [], local = [ led, timer, usb_dev, serial, bno ])]
+    #[idle(shared = [], local = [timer, serial, led, usb_dev, bno])]
     fn idle(cx: idle::Context) -> ! {
 
         // This is a simple last time timer implementation
@@ -156,24 +145,20 @@ mod app {
         // The interval that we are waiting on to send a heartbeat
         let interval = fugit::MicrosDurationU64::micros(2_000_000);
 
-        //String buffer for error messages
-        let mut debug_buff: String<64> = String::new();
-
         // This is what you can think of as the actual loop. 
         loop {
 
-            //Get bno readings
-            let gyro = match (cx.local.bno.gyro_data()) {
-                Ok(d) => d,
-                Err(e) => {
-                    write!(debug_buff, "Error: {:?} \n\r", e).unwrap();
-                    cx.local.serial.write(debug_buff.as_bytes()).unwrap();
-                    loop{}
-                }
-            };
-
-            // Polling the usb device to see if we have anything extra to play with from the other device
+           // Polling the usb device to see if we have anything extra to play with from the other device
             if cx.local.usb_dev.poll(&mut [cx.local.serial]) {
+
+                //Get bno readings
+                let gyro = match cx.local.bno.gyro_data() {
+                    Ok(d) => d,
+                    Err(e) => {
+                        cx.local.serial.write(b"Error reading from the gyro\r\n").unwrap();
+                        loop{}
+                    }
+                };
 
                 // If we do have stuff to play with, we create a buffer where the serial object can put the information in it
                 let mut buf = [0u8; 64];
@@ -181,14 +166,14 @@ mod app {
                 // Now we try to read the buffer from the serial object
                 if let Ok(count) = cx.local.serial.read(&mut buf) {
 
-                    // Then we just iterate through the buffer to see if the key 'r' shows up in it in binary 
+                    // Then we just iterate through the buffer to see if the key 'r' shows up in it in binary
                     for &byte in &buf[..count] {
-                        if byte == b'l' { 
-                            let _ = cx.local.led.set_high(); 
-                        } else if byte == b'b' { 
+                        if byte == b'l' {
+                            let _ = cx.local.led.set_high();
+                        } else if byte == b'b' {
                             reboot(RebootKind::BootSel {picoboot_disabled: false, msd_disabled: false}, RebootArch::Arm); // Exiting so that we don't need to hit the boot sel button
-                        } else { 
-                            let _ = cx.local.led.set_low(); 
+                        } else {
+                            let _ = cx.local.led.set_low();
                         }
                     }
                 }
@@ -199,17 +184,12 @@ mod app {
 
             // Checking to see if enough time has passed to send a heartbeat
             if (now - last_send) >= interval {
-
-                let mut message: String<128> = String::new();
-                write!(message,"Gyro:\n\r x: {}\n\ry: {}\n\rz: {}\n\r", gyro.x, gyro.y, gyro.z).unwrap();
-
-                let _ = cx.local.serial.write(message.as_bytes());
+                let _ = cx.local.serial.write(b"I like waffle fries!\r\n");
                 last_send = now;
             }
 
             // Putting the CPU to sleep until the next interrupt (Good practice, but we won't be doing it right now)
-            // cortex_m::asm::wfi();
-            debug_buff.clear();
+            // cortex_m::asm::wfi(); 
         }
     }
 

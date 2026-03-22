@@ -113,7 +113,7 @@ mod app {
         // This is what you can think of as the actual loop. 
         loop {
 
-            // Polling the usb device to see if we have anything extra to play with from the other device
+           // Polling the usb device to see if we have anything extra to play with from the other device
             if cx.local.usb_dev.poll(&mut [cx.local.serial]) {
 
                 // If we do have stuff to play with, we create a buffer where the serial object can put the information in it
@@ -122,14 +122,14 @@ mod app {
                 // Now we try to read the buffer from the serial object
                 if let Ok(count) = cx.local.serial.read(&mut buf) {
 
-                    // Then we just iterate through the buffer to see if the key 'r' shows up in it in binary 
+                    // Then we just iterate through the buffer to see if the key 'r' shows up in it in binary
                     for &byte in &buf[..count] {
-                        if byte == b'l' { 
-                            let _ = cx.local.led.set_high(); 
-                        } else if byte == b'b' { 
+                        if byte == b'l' {
+                            let _ = cx.local.led.set_high();
+                        } else if byte == b'b' {
                             reboot(RebootKind::BootSel {picoboot_disabled: false, msd_disabled: false}, RebootArch::Arm); // Exiting so that we don't need to hit the boot sel button
-                        } else { 
-                            let _ = cx.local.led.set_low(); 
+                        } else {
+                            let _ = cx.local.led.set_low();
                         }
                     }
                 }
