@@ -43,4 +43,4 @@ log = "0.4"
 # Fast Universal General-purpose Interval and Time (it's a crate for time and things)
 fugit = "0.3.9"
 bme280 = "0.5.1"
-bno055 = "0.4.0"
+bno08x-rs = "2.0.1"

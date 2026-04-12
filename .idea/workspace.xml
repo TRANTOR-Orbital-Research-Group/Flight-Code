@@ -12,9 +12,9 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="10f5df0f-d914-43cd-a59b-c84232e57b50" name="Changes" comment="">
-      <change afterPath="$PROJECT_DIR$/src/main_backup.rs" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/examples/serial_rtic.rs" beforeDir="false" afterPath="$PROJECT_DIR$/examples/serial_rtic.rs" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/Cargo.lock" beforeDir="false" afterPath="$PROJECT_DIR$/Cargo.lock" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/Cargo.toml" beforeDir="false" afterPath="$PROJECT_DIR$/Cargo.toml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/main.rs" beforeDir="false" afterPath="$PROJECT_DIR$/src/main.rs" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
@@ -104,7 +104,11 @@
       <workItem from="1771186701846" duration="4135000" />
       <workItem from="1773543075251" duration="7000" />
       <workItem from="1774146929652" duration="8588000" />
-      <workItem from="1774189479998" duration="4360000" />
+      <workItem from="1774189479998" duration="4756000" />
+      <workItem from="1774305078259" duration="45000" />
+      <workItem from="1774815197273" duration="3231000" />
+      <workItem from="1774930342140" duration="13000" />
+      <workItem from="1776031323786" duration="1417000" />
     </task>
     <servers />
   </component>

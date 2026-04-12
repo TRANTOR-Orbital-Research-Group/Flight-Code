@@ -24,8 +24,8 @@ pub static IMAGE_DEF: ImageDef = hal::block::ImageDef::secure_exe();
 #[rtic::app(device = hal::pac, dispatchers = [UART0_IRQ])]
 mod app {
     use super::*;
-    use bno055::{BNO055OperationMode, Bno055};
     use rp235x_hal::{pac::{I2C1}};
+    use bno08x_rs::BNO08x;
     use usb_device::{class_prelude::*, prelude::*};
     use usbd_serial::SerialPort;
 
@@ -43,10 +43,8 @@ mod app {
         timer: hal::Timer<hal::timer::CopyableTimer0>,
         usb_dev: UsbDevice<'static, hal::usb::UsbBus>,
         serial: SerialPort<'static, hal::usb::UsbBus>,
-        bno: Bno055<I2C<I2C1, (
-            rp235x_hal::gpio::Pin<rp235x_hal::gpio::bank0::Gpio18,rp235x_hal::gpio::FunctionI2c, rp235x_hal::gpio::PullUp>,
-            rp235x_hal::gpio::Pin<rp235x_hal::gpio::bank0::Gpio19,rp235x_hal::gpio::FunctionI2c, rp235x_hal::gpio::PullUp>
-        )>>
+        bno: BNO08x<'static, I2C<I2C1, (hal::gpio::Pin<hal::gpio::bank0::Gpio18, hal::gpio::FunctionI2c, hal::gpio::PullUp>,
+                                        hal::gpio::Pin<hal::gpio::bank0::Gpio19, hal::gpio::FunctionI2c, hal::gpio::PullUp>)>>
     }
 
     // This is the init task, which is a lot like the `void setup()` function in Arduino cpp
@@ -101,9 +99,9 @@ mod app {
             .build();
 
         //Waiting for the usb initialize and connect to the computer
-        // while !serial.dtr() {
-        //     usb_dev.poll(&mut [&mut serial]);
-        // }
+        while !serial.dtr() {
+            usb_dev.poll(&mut [&mut serial]);
+        }
 
         //Creating a new i2c bus on pins 18 and 19
         let i2c = I2C::i2c1(
@@ -115,19 +113,35 @@ mod app {
             125_000_000.Hz(),
         );
 
-        let mut bno = Bno055::new(i2c);
-        let _ = bno.init(&mut timer);
-        // match bno.init(&mut timer) {
-        //     Ok(b) => b,
-        //     Err(_) => {
-        //         let _ = serial.write(b"Error initializing the BNO\r\n");
-        //         loop{}
-        //     }
-        // };
-        //let _ = bno.set_mode(BNO055OperationMode::NDOF, &mut timer);
-        
+        let mut bno = BNO08x::new_with_interface(i2c);
+
+        match (bno.init()) {
+            Ok(d) => d,
+            Err(e) => {
+                serial.write(b"ERROR! Initializing BNO085 FAILED!").unwrap();
+                loop{}
+            }
+        };
+
+        match bno.enable_rotation_vector(50) {
+            Ok(d) => d,
+            Err(e) => {
+                serial.write(b"ERROR! Enabling rotation vector for BNO085 FAILED!").unwrap();
+                loop{}
+            }
+        };
+
+        match bno.enable_gyro(50).unwrap() {
+            Ok(d) => d,
+            Err(e) => {
+                serial.write(b"ERROR! Enabling gyro for BNO085 FAILED!").unwrap();
+                loop {}
+            }
+        };
+
+
         // Returning our two structs
-        (Shared {}, Local { led, timer, usb_dev, serial, bno })
+        (Shared {}, Local { led, timer, usb_dev, serial, bno})
     }
 
 
@@ -145,20 +159,21 @@ mod app {
         // The interval that we are waiting on to send a heartbeat
         let interval = fugit::MicrosDurationU64::micros(2_000_000);
 
+        /*
+        0- i, 1- j, 2- k, 3- real angular position
+        */
+        let mut rotation_data;
+
+        /*
+        0- x, 1- y, 2- z angular velocity
+        */
+        let mut gyro_data;
+
         // This is what you can think of as the actual loop. 
         loop {
 
            // Polling the usb device to see if we have anything extra to play with from the other device
             if cx.local.usb_dev.poll(&mut [cx.local.serial]) {
-
-                //Get bno readings
-                let gyro = match cx.local.bno.gyro_data() {
-                    Ok(d) => d,
-                    Err(e) => {
-                        cx.local.serial.write(b"Error reading from the gyro\r\n").unwrap();
-                        loop{}
-                    }
-                };
 
                 // If we do have stuff to play with, we create a buffer where the serial object can put the information in it
                 let mut buf = [0u8; 64];
@@ -176,15 +191,45 @@ mod app {
                             let _ = cx.local.led.set_low();
                         }
                     }
+
+
+                    rotation_data = match cx.local.bno.rotation_quaternion() {
+                        Ok(d) => d,
+                        Err(e) => {
+                            cx.local.serial.write(b"ERROR! Getting rotation quaternion from BNO085 FAILED!").unwrap();
+                            loop {}
+                        }
+                    };
+
+                    gyro_data = match cx.local.bno.gyro() {
+                        Ok(d) => d,
+                        Err(e) => {
+                            cx.local.serial.write(b"ERROR! Getting gyroscope from BNO085 FAILED!").unwrap();
+                            loop {}
+                        }
+                    };
                 }
             }
 
             // The current time (get_counter is a lot like millis in cpp)
             let now = cx.local.timer.get_counter();
 
+            let mut gyro_buf = [0u8; 64];
+            let mut rotation_buf = [0u8; 64];
+
             // Checking to see if enough time has passed to send a heartbeat
-            if (now - last_send) >= interval {
-                let _ = cx.local.serial.write(b"I like waffle fries!\r\n");
+            if (now - last_send) >= interval
+            {
+                let _ = write!(&mut gyro_buf, "GYRO: ANGULAR VELOCITY\r\n x: {}, y: {}, z: {}\r\n"
+                    , gyro_data[0], gyro_data[1], gyro_data[2]);
+
+                let _ = write!(&mut rotation_buf, "QUATERNION: ANGULAR POSITION\r\n i: {}, j: {}, k: {}, REAL pos: {}\r\n"
+                       , rotation_data[0], rotation_data[1], rotation_data[2], rotation_data[3]);
+
+                let _ = cx.local.serial.write(&gyro_buf);
+                let _ = cx.local.serial.write(&rotation_buf);
+                let _ = cx.local.serial.write(b"Pulse Complete!\r\n");
+
                 last_send = now;
             }
 
