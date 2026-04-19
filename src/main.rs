@@ -9,6 +9,8 @@ use rp235x_hal::reboot::{reboot, RebootKind, RebootArch};
 use fugit::RateExtU32;
 use heapless::String;
 use core::fmt::Write;
+use bno080::wrapper::BNO080;
+use bno080::interface::I2cInterface;
 
 // Tells the Rust where to put the actual image (I think) 
 use hal::block::ImageDef;
@@ -25,7 +27,6 @@ pub static IMAGE_DEF: ImageDef = hal::block::ImageDef::secure_exe();
 mod app {
     use super::*;
     use rp235x_hal::{pac::{I2C1}};
-    use bno08x_rs::BNO08x;
     use usb_device::{class_prelude::*, prelude::*};
     use usbd_serial::SerialPort;
 
@@ -43,8 +44,8 @@ mod app {
         timer: hal::Timer<hal::timer::CopyableTimer0>,
         usb_dev: UsbDevice<'static, hal::usb::UsbBus>,
         serial: SerialPort<'static, hal::usb::UsbBus>,
-        bno: BNO08x<'static, I2C<I2C1, (hal::gpio::Pin<hal::gpio::bank0::Gpio18, hal::gpio::FunctionI2c, hal::gpio::PullUp>,
-                                        hal::gpio::Pin<hal::gpio::bank0::Gpio19, hal::gpio::FunctionI2c, hal::gpio::PullUp>)>>
+        bno: BNO080<I2cInterface<I2C<I2C1, (hal::gpio::Pin<hal::gpio::bank0::Gpio18, hal::gpio::FunctionI2c, hal::gpio::PullUp>,
+                                        hal::gpio::Pin<hal::gpio::bank0::Gpio19, hal::gpio::FunctionI2c, hal::gpio::PullUp>)>>>
     }
 
     // This is the init task, which is a lot like the `void setup()` function in Arduino cpp
@@ -113,9 +114,11 @@ mod app {
             125_000_000.Hz(),
         );
 
-        let mut bno = BNO08x::new_with_interface(i2c);
+        let i2c_iface = bno080::interface::I2cInterface::default(i2c);
 
-        match (bno.init()) {
+        let mut bno = BNO080::new_with_interface(i2c_iface);
+
+        match (bno.init(&mut timer)) {
             Ok(d) => d,
             Err(e) => {
                 serial.write(b"ERROR! Initializing BNO085 FAILED!").unwrap();
@@ -131,7 +134,7 @@ mod app {
             }
         };
 
-        match bno.enable_gyro(50).unwrap() {
+        match bno.enable_gyro(50) {
             Ok(d) => d,
             Err(e) => {
                 serial.write(b"ERROR! Enabling gyro for BNO085 FAILED!").unwrap();
@@ -162,12 +165,13 @@ mod app {
         /*
         0- i, 1- j, 2- k, 3- real angular position
         */
-        let mut rotation_data;
+        let mut rotation_data = [0f32, 0f32, 0f32, 0f32];
 
         /*
         0- x, 1- y, 2- z angular velocity
         */
-        let mut gyro_data;
+        let mut gyro_data = [0f32, 0f32, 0f32];
+
 
         // This is what you can think of as the actual loop. 
         loop {
@@ -192,7 +196,6 @@ mod app {
                         }
                     }
 
-
                     rotation_data = match cx.local.bno.rotation_quaternion() {
                         Ok(d) => d,
                         Err(e) => {
@@ -214,20 +217,20 @@ mod app {
             // The current time (get_counter is a lot like millis in cpp)
             let now = cx.local.timer.get_counter();
 
-            let mut gyro_buf = [0u8; 64];
-            let mut rotation_buf = [0u8; 64];
+            let mut gyro_str: String<128> = String::new();
+            let mut rotation_str: String<128> = String::new();
 
             // Checking to see if enough time has passed to send a heartbeat
             if (now - last_send) >= interval
             {
-                let _ = write!(&mut gyro_buf, "GYRO: ANGULAR VELOCITY\r\n x: {}, y: {}, z: {}\r\n"
+                let _ = write!(gyro_str, "GYRO: ANGULAR VELOCITY\r\n x: {}, y: {}, z: {}\r\n"
                     , gyro_data[0], gyro_data[1], gyro_data[2]);
 
-                let _ = write!(&mut rotation_buf, "QUATERNION: ANGULAR POSITION\r\n i: {}, j: {}, k: {}, REAL pos: {}\r\n"
+                let _ = write!(rotation_str, "QUATERNION: ANGULAR POSITION\r\n i: {}, j: {}, k: {}, REAL pos: {}\r\n"
                        , rotation_data[0], rotation_data[1], rotation_data[2], rotation_data[3]);
 
-                let _ = cx.local.serial.write(&gyro_buf);
-                let _ = cx.local.serial.write(&rotation_buf);
+                let _ = cx.local.serial.write(&gyro_str.as_bytes());
+                let _ = cx.local.serial.write(&rotation_str.as_bytes());
                 let _ = cx.local.serial.write(b"Pulse Complete!\r\n");
 
                 last_send = now;
