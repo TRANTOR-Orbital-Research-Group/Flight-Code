@@ -1,11 +1,16 @@
 #![no_std]
 #![no_main]
 
-use rp235x_hal as hal;
+use rp235x_hal::{self as hal, gpio::Pins, i2c::I2C, Sio, Timer};
 use {panic_probe as _};
 use embedded_hal::digital::OutputPin;
 use defmt_rtt as _;
 use rp235x_hal::reboot::{reboot, RebootKind, RebootArch};
+use fugit::RateExtU32;
+use heapless::String;
+use core::fmt::Write;
+use bno080::wrapper::BNO080;
+use bno080::interface::I2cInterface;
 
 // Tells the Rust where to put the actual image (I think) 
 use hal::block::ImageDef;
@@ -21,6 +26,7 @@ pub static IMAGE_DEF: ImageDef = hal::block::ImageDef::secure_exe();
 #[rtic::app(device = hal::pac, dispatchers = [UART0_IRQ])]
 mod app {
     use super::*;
+    use rp235x_hal::{pac::{I2C1}};
     use usb_device::{class_prelude::*, prelude::*};
     use usbd_serial::SerialPort;
 
@@ -38,6 +44,8 @@ mod app {
         timer: hal::Timer<hal::timer::CopyableTimer0>,
         usb_dev: UsbDevice<'static, hal::usb::UsbBus>,
         serial: SerialPort<'static, hal::usb::UsbBus>,
+        bno: BNO080<I2cInterface<I2C<I2C1, (hal::gpio::Pin<hal::gpio::bank0::Gpio18, hal::gpio::FunctionI2c, hal::gpio::PullUp>,
+                                        hal::gpio::Pin<hal::gpio::bank0::Gpio19, hal::gpio::FunctionI2c, hal::gpio::PullUp>)>>>
     }
 
     // This is the init task, which is a lot like the `void setup()` function in Arduino cpp
@@ -74,7 +82,7 @@ mod app {
         let led = pins.gpio25.into_push_pull_output();
 
         // The timer that we need in our Local struct for our idle task
-        let timer = hal::Timer::new_timer0(cx.device.TIMER0, &mut resets, &clocks);
+        let mut timer = hal::Timer::new_timer0(cx.device.TIMER0, &mut resets, &clocks);
 
         // Initializing the usb bus so that we can make a device that uses the bus for our Local struct
         let usb_bus_alloc = cx.local.usb_bus.insert(UsbBusAllocator::new(
@@ -82,17 +90,67 @@ mod app {
         ));
 
         // Creating a serial port on the bus
-        let serial = SerialPort::new(usb_bus_alloc);
+        let mut serial = SerialPort::new(usb_bus_alloc);
 
         // Creating a serial device that uses that port and that bus
-        let usb_dev = UsbDeviceBuilder::new(usb_bus_alloc, UsbVidPid(0x16c0, 0x27dd))
+        let mut usb_dev = UsbDeviceBuilder::new(usb_bus_alloc, UsbVidPid(0x16c0, 0x27dd))
             .strings(&[StringDescriptors::default().product("RTIC Serial")])
             .unwrap()
             .device_class(2)
             .build();
-        
+
+        //Waiting for the usb initialize and connect to the computer
+        while !serial.dtr() {
+            usb_dev.poll(&mut [&mut serial]);
+        }
+
+        //Creating a new i2c bus on pins 18 and 19
+        let i2c = I2C::i2c1(
+            cx.device.I2C1,
+            pins.gpio18.reconfigure(), // sda
+            pins.gpio19.reconfigure(), // scl
+            400.kHz(),
+            &mut resets,
+            125_000_000.Hz(),
+        );
+
+        // BNO080 uses an I2cInterface struct to interface with I2C. 
+        // I2cInterface::default() converts an I2C object to an I2cInterface object for BNO080
+        let i2c_iface = bno080::interface::I2cInterface::default(i2c);
+
+        // Create the BNO080 instance using I2C
+        let mut bno = BNO080::new_with_interface(i2c_iface);
+
+        // Initialize BNO080 object
+        match (bno.init(&mut timer)) {
+            Ok(d) => d,
+            Err(e) => {
+                serial.write(b"ERROR! Initializing BNO085 FAILED: {e}").unwrap();
+                loop{}
+            }
+        };
+
+        // Allow bno to collect rotation data
+        match bno.enable_rotation_vector(50) {
+            Ok(d) => d,
+            Err(e) => {
+                serial.write(b"ERROR! Enabling rotation vector for BNO085 FAILED: {e}").unwrap();
+                loop{}
+            }
+        };
+
+        // Allow bno to collect gyroscope data
+        match bno.enable_gyro(50) {
+            Ok(d) => d,
+            Err(e) => {
+                serial.write(b"ERROR! Enabling gyro for BNO085 FAILED: {e}").unwrap();
+                loop {}
+            }
+        };
+
+
         // Returning our two structs
-        (Shared {}, Local { led, timer, usb_dev, serial })
+        (Shared {}, Local { led, timer, usb_dev, serial, bno})
     }
 
 
@@ -101,7 +159,7 @@ mod app {
     // The thing above it is a flag that tells Rust what it will have in scope; currently we just have 
     // a local set of variables because we don't need any shared variables right now
     // It takes in a context, which is how you access all of the variables in local and shared.
-    #[idle(shared = [], local = [timer, serial, led, usb_dev])]
+    #[idle(shared = [], local = [timer, serial, led, usb_dev, bno])]
     fn idle(cx: idle::Context) -> ! {
 
         // This is a simple last time timer implementation
@@ -109,6 +167,13 @@ mod app {
 
         // The interval that we are waiting on to send a heartbeat
         let interval = fugit::MicrosDurationU64::micros(2_000_000);
+
+        // Index: 0- i, 1- j, 2- k, 3- real angular position
+        let mut rotation_data = [0f32, 0f32, 0f32, 0f32];
+
+        // Index: 0- x, 1- y, 2- z angular velocity
+        let mut gyro_data = [0f32, 0f32, 0f32];
+
 
         // This is what you can think of as the actual loop. 
         loop {
@@ -138,13 +203,50 @@ mod app {
             // The current time (get_counter is a lot like millis in cpp)
             let now = cx.local.timer.get_counter();
 
+            let mut gyro_str: String<128> = String::new();
+            let mut rotation_str: String<128> = String::new();
+
             // Checking to see if enough time has passed to send a heartbeat
-            if (now - last_send) >= interval {
-                let _ = cx.local.serial.write(b"I like waffle fries!\r\n");
+            if (now - last_send) >= interval
+            {
+                // This method actually collects the data to be distributed to rotation_data and gyro_data
+                // Run this for data collection
+                cx.local.bno.handle_all_messages(cx.local.timer, 1u8);
+
+                // Assigns the rotation quaternion data to our rotation_data array
+                rotation_data = match cx.local.bno.rotation_quaternion() {
+                    Ok(d) => d,
+                    Err(e) => {
+                        cx.local.serial.write(b"ERROR! Getting rotation quaternion from BNO085 FAILED!").unwrap();
+                        loop {}
+                    }
+                };
+
+                // Assigns the gyroscope data to our gyro_data array
+                gyro_data = match cx.local.bno.gyro() {
+                    Ok(d) => d,
+                    Err(e) => {
+                        cx.local.serial.write(b"ERROR! Getting gyroscope from BNO085 FAILED!").unwrap();
+                        loop {}
+                    }
+                };
+
+                // Write data to serial
+
+                let _ = write!(gyro_str, "GYRO: ANGULAR VELOCITY\r\n x: {}, y: {}, z: {}\r\n"
+                    , gyro_data[0], gyro_data[1], gyro_data[2]);
+
+                let _ = write!(rotation_str, "QUATERNION: ANGULAR POSITION\r\n i: {}, j: {}, k: {}, REAL pos: {}\r\n"
+                       , rotation_data[0], rotation_data[1], rotation_data[2], rotation_data[3]);
+
+                let _ = cx.local.serial.write(&gyro_str.as_bytes());
+                let _ = cx.local.serial.write(&rotation_str.as_bytes());
+                let _ = cx.local.serial.write(b"Pulse Complete!\r\n");
+
                 last_send = now;
             }
 
-            // Putting the CPU to sleed until the next interrupt (Good practice, but we won't be doing it right now)
+            // Putting the CPU to sleep until the next interrupt (Good practice, but we won't be doing it right now)
             // cortex_m::asm::wfi(); 
         }
     }

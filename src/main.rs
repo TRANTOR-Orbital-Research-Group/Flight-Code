@@ -1,12 +1,8 @@
-/* 
- * 
- * Attempting to get the BME280 working with the pico.
- * 
- */
+#![no_std]
+#![no_main]
 
-use rp235x_hal as hal;
-use hal::block::ImageDef;
-use rp235x_hal::{spi, Clock};
+use rp235x_hal::{self as hal, gpio::Pins, i2c::I2C, Sio, Timer};
+use {panic_probe as _};
 use embedded_hal::digital::OutputPin;
 use {panic_probe as _};
 use defmt_rtt as _;
@@ -15,71 +11,71 @@ use embedded_sdmmc::{SdCard, TimeSource, Timestamp, VolumeIdx, VolumeManager};
 use rp235x_hal::fugit::RateExtU32;
 use heapless::String;
 use core::fmt::Write;
-use rp235x_hal::reboot::{reboot, RebootKind, RebootArch};
-use embedded_hal::spi::SpiBus;
-use embedded_sdmmc::BlockDevice;
+use bno080::wrapper::BNO080;
+use bno080::interface::I2cInterface;
 
-/// Tell the Boot ROM about our application
+// Tells the Rust where to put the actual image (I think) 
+use hal::block::ImageDef;
 #[unsafe(link_section = ".start_block")]
 #[used]
 pub static IMAGE_DEF: ImageDef = hal::block::ImageDef::secure_exe();
-/// External high-speed crystal on the Raspberry Pi Pico 2 board is 12 MHz.
-/// Adjust if your board has a different frequency
-const XTAL_FREQ_HZ: u32 = 12_000_000u32;
-// USB Device support
-use usb_device::{class_prelude::*, prelude::*};
-// USB Communications Class Device support
-use usbd_serial::SerialPort;
 
 
+// This is where the actual RTIC application starts. We see the device as our hal's peripheral access crate and the dispacter,
+// which is the interrupt vector for the software tasks. This means that all of our software interrupts use the UART0_IRQ interrupt vector
+// which means that they all have a priority 2 for RTIC. We can (and likely will) add more dispatchers later so that we can have different 
+// priorities for all of our different software tasks
+#[rtic::app(device = hal::pac, dispatchers = [UART0_IRQ])]
+mod app {
+    use super::*;
+    use rp235x_hal::{pac::{I2C1}};
+    use usb_device::{class_prelude::*, prelude::*};
+    use usbd_serial::SerialPort;
 
-
-/// Code from https://github.com/rp-rs/rp-hal-boards/blob/main/boards/rp-pico/examples/pico_spi_sd_card.rs
-/// A dummy timesource, which is mostly important for creating files.
-#[derive(Default)]
-pub struct DummyTimesource();
-
-impl TimeSource for DummyTimesource {
-    // In theory you could use the RTC of the rp2040 here, if you had
-    // any external time synchronizing device.
-    fn get_timestamp(&self) -> Timestamp {
-        Timestamp {
-            year_since_1970: 0,
-            zero_indexed_month: 0,
-            zero_indexed_day: 0,
-            hours: 0,
-            minutes: 0,
-            seconds: 0,
-        }
+    // Where you put the shared resources (we don't have to name the struct shared, that was just convienent(we could have named it Steven).)
+    // We can have as many of these as we want, we just have to name them different things and make sure we say that they are all shared
+    #[shared]
+    struct Shared {
+        // Resources shared between different tasks (none right now, because we don't have any other tasks)
     }
-}
 
+    // Same thing as shared but it is only going to be in one task (These will belong to the idle task)
+    #[local]
+    struct Local {
+        led: hal::gpio::Pin<hal::gpio::bank0::Gpio25, hal::gpio::FunctionSioOutput, hal::gpio::PullDown>,
+        timer: hal::Timer<hal::timer::CopyableTimer0>,
+        usb_dev: UsbDevice<'static, hal::usb::UsbBus>,
+        serial: SerialPort<'static, hal::usb::UsbBus>,
+        bno: BNO080<I2cInterface<I2C<I2C1, (hal::gpio::Pin<hal::gpio::bank0::Gpio18, hal::gpio::FunctionI2c, hal::gpio::PullUp>,
+                                        hal::gpio::Pin<hal::gpio::bank0::Gpio19, hal::gpio::FunctionI2c, hal::gpio::PullUp>)>>>
+    }
 
-#[hal::entry]
-fn main() -> ! {
-    // Grab our singleton objects
-    let mut pac = hal::pac::Peripherals::take().unwrap();
+    // This is the init task, which is a lot like the `void setup()` function in Arduino cpp
+    // Note that it creates the Shared and Local structs that our tasks get to use
+    #[init(local = [usb_bus: Option<UsbBusAllocator<hal::usb::UsbBus>> = None])]
+    fn init(cx: init::Context) -> (Shared, Local) {
 
-    // Set up the watchdog driver - needed by the clock setup code
-    let mut watchdog = hal::Watchdog::new(pac.WATCHDOG);
+        // All of the peripherals are off when the pico powers on, so we need the resets controller to be able to turn them on
+        // That is what this is
+        let mut resets = cx.device.RESETS;
 
-    // Configure the clocks
-    //
-    // The default is to generate a 125 MHz system clock
-    let clocks = hal::clocks::init_clocks_and_plls(
-        XTAL_FREQ_HZ,
-        pac.XOSC,
-        pac.CLOCKS,
-        pac.PLL_SYS,
-        pac.PLL_USB,
-        &mut pac.RESETS,
-        &mut watchdog,
-    )
-        .ok()
-        .unwrap();
+        // This is the builtin watchdog. We will likely use it for flights, but for now we need it just so that we can use the clock
+        let mut watchdog = hal::Watchdog::new(cx.device.WATCHDOG);
+        
+        // Just what it sounds like, the clock of the pico
+        let clocks = hal::clocks::init_clocks_and_plls(
+            12_000_000u32,
+            cx.device.XOSC,
+            cx.device.CLOCKS,
+            cx.device.PLL_SYS,
+            cx.device.PLL_USB,
+            &mut resets,
+            &mut watchdog,
+        ).ok().unwrap();
 
-    // The single-cycle I/O block controls our GPIO pins
-    let sio = hal::Sio::new(pac.SIO);
+        // This is the Single cycle Input Output devices, which are basically just some fast gpio pins that connect close to the 
+        // cpu as best as I can figure. We use them to create the pins just down a few lines
+        let sio = hal::Sio::new(cx.device.SIO);
 
     // Set the pins up according to their function on this particular board
     let pins = hal::gpio::Pins::new(
@@ -102,190 +98,166 @@ fn main() -> ! {
         &mut pac.RESETS,
     ));
 
-    // Creating a Serial port on top of the usb bus
-    let mut serial = SerialPort::new(&usb_bus);
+        // Creating a serial port on the bus
+        let mut serial = SerialPort::new(usb_bus_alloc);
 
+        // Creating a serial device that uses that port and that bus
+        let mut usb_dev = UsbDeviceBuilder::new(usb_bus_alloc, UsbVidPid(0x16c0, 0x27dd))
+            .strings(&[StringDescriptors::default().product("RTIC Serial")])
+            .unwrap()
+            .device_class(2)
+            .build();
 
-    //Set the LED Pin
-    let mut led_pin = pins.gpio25.into_push_pull_output();
-
-    // Creating the device based on the serial port based on the usb bus
-    let mut usb_dev = UsbDeviceBuilder::new(&usb_bus, UsbVidPid(0x16c0, 0x27dd))
-        .strings(&[StringDescriptors::default()
-            .manufacturer("implRust")
-            .product("Ferris")
-            .serial_number("TEST")])
-        .unwrap()
-        .device_class(2) // 2 for the CDC, from: https://www.usb.org/defined-class-codes
-        .build();
-
-    // Waiting for the usb initialize and connect to the computer
-    loop {
-        usb_dev.poll(&mut [&mut serial]);
-        if serial.dtr() {
-            break; 
+        //Waiting for the usb initialize and connect to the computer
+        while !serial.dtr() {
+            usb_dev.poll(&mut [&mut serial]);
         }
-    }
 
-    let _ = serial.write(b"Beginning the SD creation stuff...\n\r");
+        //Creating a new i2c bus on pins 18 and 19
+        let i2c = I2C::i2c1(
+            cx.device.I2C1,
+            pins.gpio18.reconfigure(), // sda
+            pins.gpio19.reconfigure(), // scl
+            400.kHz(),
+            &mut resets,
+            125_000_000.Hz(),
+        );
 
-    let spi_miso = pins.gpio16
-    .into_pull_up_input()
-    .into_function::<hal::gpio::FunctionSpi>();
+        // BNO080 uses an I2cInterface struct to interface with I2C. 
+        // I2cInterface::default() converts an I2C object to an I2cInterface object for BNO080
+        let i2c_iface = bno080::interface::I2cInterface::default(i2c);
 
-    let mut spi_cs = pins.gpio17.into_push_pull_output();
-    let spi_sck = pins.gpio18.into_function::<hal::gpio::FunctionSpi>();
-    let spi_mosi = pins.gpio19.into_function::<hal::gpio::FunctionSpi>();
-    let spi_bus = hal::spi::Spi::<_, _, _, 8>::new(pac.SPI0, (spi_mosi, spi_miso, spi_sck));
+        // Create the BNO080 instance using I2C
+        let mut bno = BNO080::new_with_interface(i2c_iface);
 
-    let _ = serial.write(b"Created spi_bus.\n\r");
-
-
-    let spi = spi_bus.init(
-        &mut pac.RESETS,
-        clocks.peripheral_clock.freq(),
-        400.kHz(), // card initialization happens at low baud rate
-        embedded_hal::spi::MODE_0,
-    );
-
-    spi_cs.set_high().unwrap();
-    
-    
-    let spi = ExclusiveDevice::new(spi, spi_cs, &mut timer).unwrap();
-    
-    let _ = serial.write(b"Created spi.\n\r");
-    
-
-    let sdcard = SdCard::new(spi, &mut timer_sd);
-
-    let _ = serial.write(b"Created sdcard.\n\r");
-    
-
-    // let blocks = sdcard.num_blocks();
-    let bytes = match sdcard.num_bytes() {
-        Ok(num) => num,
-        Err(error) => {
-            let mut last_time = timer_nonblocking.get_counter();
-            let mut buf = [0u8; 8];
-            loop {
-                usb_dev.poll(&mut [&mut serial]);
-                if (timer_nonblocking.get_counter() - last_time).to_millis() > 2000 {
-                    let mut err_msg: String<64> = String::new();
-                    let _ = write!(err_msg, "Currently Erroring: {:?}\r\n", error);
-                    let _ = serial.write(err_msg.as_bytes());
-                    last_time = timer_nonblocking.get_counter();
-
-                }
-                if let Ok(count) = serial.read(&mut buf) {
-                    if buf[..count].contains(&b'b') {
-                        reboot(RebootKind::BootSel {picoboot_disabled: false, msd_disabled: false}, RebootArch::Arm);
-                    }
-                }
-
-            }
-        }
-    };
-    let mut msg: String<128> = String::new();
-    let _ = write!(msg, "Found the size of the SD card: {} bytes or {} gigabytes\r\n", bytes, bytes as f32 /1_000_000_000f32);
-    let _ = serial.write(msg.as_bytes());
-
-    
-    let mut volume_mgr = VolumeManager::new(sdcard, DummyTimesource::default());
-
-
-    let _ = serial.write(b"Starting volume making");
-
-
-    let mut volume0 = match volume_mgr.open_volume(VolumeIdx(0))
-    {
-        Ok(vol) => vol,
-        Err(e) => {
-            loop
-            {
-                let mut debug_message: String<128> = String::new();
-                let _ = write!(debug_message, "ERROR! {:?}\n\r", e);
-                let _ = serial.write(debug_message.as_bytes());
-
-                if usb_dev.poll(&mut [&mut serial]) {
-                    let mut buf = [0u8; 65];
-                    if let Ok(count) = serial.read(&mut buf) {
-                        for &byte in &buf[..count] {
-                            if byte == b'b' {
-                                reboot(RebootKind::BootSel {picoboot_disabled: false, msd_disabled: false}, RebootArch::Arm);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    };
-
-    let mut msg: String<64> = String::new();
-    let _ = write!(msg, "Created volume0.\r\n");
-    let _ = serial.write(msg.as_bytes());
-
-    let mut root_dir = volume0.open_root_dir().expect("failed to open root dir");
-
-    let mut msg: String<64> = String::new();
-    let _ = write!(msg, "Opened root directiory.\r\n");
-    let _ = serial.write(msg.as_bytes());
-
-    let mut my_file = match root_dir.open_file_in_dir("RUST.TXT", embedded_sdmmc::Mode::ReadOnly) {
-            Ok(file) => file,
-            Err(error) => {
-                let mut last_time = timer_nonblocking.get_counter();
-                let mut buf = [0u8; 8];
-                loop {
-                    usb_dev.poll(&mut [&mut serial]);
-                    if (timer_nonblocking.get_counter() - last_time).to_millis() > 2000 {
-                        let mut err_msg: String<64> = String::new();
-                        let _ = write!(err_msg, "Currently Erroring: {:?}\r\n", error);
-                        let _ = serial.write(err_msg.as_bytes());
-                        last_time = timer_nonblocking.get_counter();
-
-                    }
-                    if let Ok(count) = serial.read(&mut buf) {
-                        if buf[..count].contains(&b'b') {
-                            reboot(RebootKind::BootSel {picoboot_disabled: false, msd_disabled: false}, RebootArch::Arm);
-                        }
-                    }
-
-                }
+        // Initialize BNO080 object
+        match (bno.init(&mut timer)) {
+            Ok(d) => d,
+            Err(e) => {
+                serial.write(b"ERROR! Initializing BNO085 FAILED: {e}").unwrap();
+                loop{}
             }
         };
 
-    let mut msg: String<64> = String::new();
-    let _ = write!(msg, "Opened Rust.txt.\r\n");
-    let _ = serial.write(msg.as_bytes());
+        // Allow bno to collect rotation data
+        match bno.enable_rotation_vector(50) {
+            Ok(d) => d,
+            Err(e) => {
+                serial.write(b"ERROR! Enabling rotation vector for BNO085 FAILED: {e}").unwrap();
+                loop{}
+            }
+        };
 
-    // Settting the led high so that we know that it sucessfully read
-    led_pin.set_high().unwrap();
+        // Allow bno to collect gyroscope data
+        match bno.enable_gyro(50) {
+            Ok(d) => d,
+            Err(e) => {
+                serial.write(b"ERROR! Enabling gyro for BNO085 FAILED: {e}").unwrap();
+                loop {}
+            }
+        };
 
-    let mut ticks = 0;
 
-    loop{
-        usb_dev.poll(&mut [&mut serial]);
+        // Returning our two structs
+        (Shared {}, Local { led, timer, usb_dev, serial, bno})
+    }
 
-        // Updating the ticks
-        ticks += 1;
 
-        // Responding if it hasn't said hello
-        if ticks > 1_000_000 {
-            // Writes bytes from `data` into the port and returns the number of bytes written.
-            let _ = serial.write(b"Looping!\r\n");
-            ticks -= 1_000_000;
-        }
 
-        if !my_file.is_eof() && serial.dtr() {
-            let mut buffer = [0u8; 32];
+    // This is the idle loop. The idle loop is the basically the `void loop()` part of C++ Arduino
+    // The thing above it is a flag that tells Rust what it will have in scope; currently we just have 
+    // a local set of variables because we don't need any shared variables right now
+    // It takes in a context, which is how you access all of the variables in local and shared.
+    #[idle(shared = [], local = [timer, serial, led, usb_dev, bno])]
+    fn idle(cx: idle::Context) -> ! {
 
-            if let Ok(n) = my_file.read(&mut buffer) {
-                if let Ok(s) = core::str::from_utf8(&buffer[..n]) {
-                    serial.write(s.as_bytes()).unwrap();
-                } else {
-                    serial.write(&buffer[..n]).unwrap();
+        // This is a simple last time timer implementation
+        let mut last_send = cx.local.timer.get_counter();
+
+        // The interval that we are waiting on to send a heartbeat
+        let interval = fugit::MicrosDurationU64::micros(2_000_000);
+
+        // Index: 0- i, 1- j, 2- k, 3- real angular position
+        let mut rotation_data = [0f32, 0f32, 0f32, 0f32];
+
+        // Index: 0- x, 1- y, 2- z angular velocity
+        let mut gyro_data = [0f32, 0f32, 0f32];
+
+
+        // This is what you can think of as the actual loop. 
+        loop {
+
+           // Polling the usb device to see if we have anything extra to play with from the other device
+            if cx.local.usb_dev.poll(&mut [cx.local.serial]) {
+
+                // If we do have stuff to play with, we create a buffer where the serial object can put the information in it
+                let mut buf = [0u8; 64];
+
+                // Now we try to read the buffer from the serial object
+                if let Ok(count) = cx.local.serial.read(&mut buf) {
+
+                    // Then we just iterate through the buffer to see if the key 'r' shows up in it in binary
+                    for &byte in &buf[..count] {
+                        if byte == b'l' {
+                            let _ = cx.local.led.set_high();
+                        } else if byte == b'b' {
+                            reboot(RebootKind::BootSel {picoboot_disabled: false, msd_disabled: false}, RebootArch::Arm); // Exiting so that we don't need to hit the boot sel button
+                        } else {
+                            let _ = cx.local.led.set_low();
+                        }
+                    }
                 }
             }
+
+            // The current time (get_counter is a lot like millis in cpp)
+            let now = cx.local.timer.get_counter();
+
+            let mut gyro_str: String<128> = String::new();
+            let mut rotation_str: String<128> = String::new();
+
+            // Checking to see if enough time has passed to send a heartbeat
+            if (now - last_send) >= interval
+            {
+                // This method actually collects the data to be distributed to rotation_data and gyro_data
+                // Run this for data collection
+                cx.local.bno.handle_all_messages(cx.local.timer, 1u8);
+
+                // Assigns the rotation quaternion data to our rotation_data array
+                rotation_data = match cx.local.bno.rotation_quaternion() {
+                    Ok(d) => d,
+                    Err(e) => {
+                        cx.local.serial.write(b"ERROR! Getting rotation quaternion from BNO085 FAILED!").unwrap();
+                        loop {}
+                    }
+                };
+
+                // Assigns the gyroscope data to our gyro_data array
+                gyro_data = match cx.local.bno.gyro() {
+                    Ok(d) => d,
+                    Err(e) => {
+                        cx.local.serial.write(b"ERROR! Getting gyroscope from BNO085 FAILED!").unwrap();
+                        loop {}
+                    }
+                };
+
+                // Write data to serial
+
+                let _ = write!(gyro_str, "GYRO: ANGULAR VELOCITY\r\n x: {}, y: {}, z: {}\r\n"
+                    , gyro_data[0], gyro_data[1], gyro_data[2]);
+
+                let _ = write!(rotation_str, "QUATERNION: ANGULAR POSITION\r\n i: {}, j: {}, k: {}, REAL pos: {}\r\n"
+                       , rotation_data[0], rotation_data[1], rotation_data[2], rotation_data[3]);
+
+                let _ = cx.local.serial.write(&gyro_str.as_bytes());
+                let _ = cx.local.serial.write(&rotation_str.as_bytes());
+                let _ = cx.local.serial.write(b"Pulse Complete!\r\n");
+
+                last_send = now;
+            }
+
+            // Putting the CPU to sleep until the next interrupt (Good practice, but we won't be doing it right now)
+            // cortex_m::asm::wfi(); 
         }
     }
+
 }
