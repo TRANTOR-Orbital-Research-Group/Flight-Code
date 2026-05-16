@@ -114,30 +114,36 @@ mod app {
             125_000_000.Hz(),
         );
 
+        // BNO080 uses an I2cInterface struct to interface with I2C. 
+        // I2cInterface::default() converts an I2C object to an I2cInterface object for BNO080
         let i2c_iface = bno080::interface::I2cInterface::default(i2c);
 
+        // Create the BNO080 instance using I2C
         let mut bno = BNO080::new_with_interface(i2c_iface);
 
+        // Initialize BNO080 object
         match (bno.init(&mut timer)) {
             Ok(d) => d,
             Err(e) => {
-                serial.write(b"ERROR! Initializing BNO085 FAILED!").unwrap();
+                serial.write(b"ERROR! Initializing BNO085 FAILED: {e}").unwrap();
                 loop{}
             }
         };
 
+        // Allow bno to collect rotation data
         match bno.enable_rotation_vector(50) {
             Ok(d) => d,
             Err(e) => {
-                serial.write(b"ERROR! Enabling rotation vector for BNO085 FAILED!").unwrap();
+                serial.write(b"ERROR! Enabling rotation vector for BNO085 FAILED: {e}").unwrap();
                 loop{}
             }
         };
 
+        // Allow bno to collect gyroscope data
         match bno.enable_gyro(50) {
             Ok(d) => d,
             Err(e) => {
-                serial.write(b"ERROR! Enabling gyro for BNO085 FAILED!").unwrap();
+                serial.write(b"ERROR! Enabling gyro for BNO085 FAILED: {e}").unwrap();
                 loop {}
             }
         };
@@ -162,14 +168,10 @@ mod app {
         // The interval that we are waiting on to send a heartbeat
         let interval = fugit::MicrosDurationU64::micros(2_000_000);
 
-        /*
-        0- i, 1- j, 2- k, 3- real angular position
-        */
+        // Index: 0- i, 1- j, 2- k, 3- real angular position
         let mut rotation_data = [0f32, 0f32, 0f32, 0f32];
 
-        /*
-        0- x, 1- y, 2- z angular velocity
-        */
+        // Index: 0- x, 1- y, 2- z angular velocity
         let mut gyro_data = [0f32, 0f32, 0f32];
 
 
@@ -195,22 +197,6 @@ mod app {
                             let _ = cx.local.led.set_low();
                         }
                     }
-
-                    rotation_data = match cx.local.bno.rotation_quaternion() {
-                        Ok(d) => d,
-                        Err(e) => {
-                            cx.local.serial.write(b"ERROR! Getting rotation quaternion from BNO085 FAILED!").unwrap();
-                            loop {}
-                        }
-                    };
-
-                    gyro_data = match cx.local.bno.gyro() {
-                        Ok(d) => d,
-                        Err(e) => {
-                            cx.local.serial.write(b"ERROR! Getting gyroscope from BNO085 FAILED!").unwrap();
-                            loop {}
-                        }
-                    };
                 }
             }
 
@@ -223,6 +209,30 @@ mod app {
             // Checking to see if enough time has passed to send a heartbeat
             if (now - last_send) >= interval
             {
+                // This method actually collects the data to be distributed to rotation_data and gyro_data
+                // Run this for data collection
+                cx.local.bno.handle_all_messages(cx.local.timer, 1u8);
+
+                // Assigns the rotation quaternion data to our rotation_data array
+                rotation_data = match cx.local.bno.rotation_quaternion() {
+                    Ok(d) => d,
+                    Err(e) => {
+                        cx.local.serial.write(b"ERROR! Getting rotation quaternion from BNO085 FAILED!").unwrap();
+                        loop {}
+                    }
+                };
+
+                // Assigns the gyroscope data to our gyro_data array
+                gyro_data = match cx.local.bno.gyro() {
+                    Ok(d) => d,
+                    Err(e) => {
+                        cx.local.serial.write(b"ERROR! Getting gyroscope from BNO085 FAILED!").unwrap();
+                        loop {}
+                    }
+                };
+
+                // Write data to serial
+
                 let _ = write!(gyro_str, "GYRO: ANGULAR VELOCITY\r\n x: {}, y: {}, z: {}\r\n"
                     , gyro_data[0], gyro_data[1], gyro_data[2]);
 
