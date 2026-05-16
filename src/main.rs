@@ -4,9 +4,11 @@
 use rp235x_hal::{self as hal, gpio::Pins, i2c::I2C, Sio, Timer};
 use {panic_probe as _};
 use embedded_hal::digital::OutputPin;
+use {panic_probe as _};
 use defmt_rtt as _;
-use rp235x_hal::reboot::{reboot, RebootKind, RebootArch};
-use fugit::RateExtU32;
+use embedded_hal_bus::spi::ExclusiveDevice;
+use embedded_sdmmc::{SdCard, TimeSource, Timestamp, VolumeIdx, VolumeManager};
+use rp235x_hal::fugit::RateExtU32;
 use heapless::String;
 use core::fmt::Write;
 use bno080::wrapper::BNO080;
@@ -75,19 +77,26 @@ mod app {
         // cpu as best as I can figure. We use them to create the pins just down a few lines
         let sio = hal::Sio::new(cx.device.SIO);
 
-        // The struct that holds all of the - you guessed it! - pins
-        let pins = hal::gpio::Pins::new(cx.device.IO_BANK0, cx.device.PADS_BANK0, sio.gpio_bank0, &mut resets);
+    // Set the pins up according to their function on this particular board
+    let pins = hal::gpio::Pins::new(
+        pac.IO_BANK0,
+        pac.PADS_BANK0,
+        sio.gpio_bank0,
+        &mut pac.RESETS,
+    );
 
-        // The led that we want to play with
-        let led = pins.gpio25.into_push_pull_output();
+    let mut timer = hal::Timer::new_timer0(pac.TIMER0, &mut pac.RESETS, &clocks);
+    let mut timer_sd = timer.clone();
+    let timer_nonblocking = timer.clone();
 
-        // The timer that we need in our Local struct for our idle task
-        let mut timer = hal::Timer::new_timer0(cx.device.TIMER0, &mut resets, &clocks);
-
-        // Initializing the usb bus so that we can make a device that uses the bus for our Local struct
-        let usb_bus_alloc = cx.local.usb_bus.insert(UsbBusAllocator::new(
-            hal::usb::UsbBus::new(cx.device.USB, cx.device.USB_DPRAM, clocks.usb_clock, true, &mut resets)
-        ));
+    // Creating a usb bus to use
+    let usb_bus = UsbBusAllocator::new(hal::usb::UsbBus::new(
+        pac.USB,
+        pac.USB_DPRAM,
+        clocks.usb_clock,
+        true,
+        &mut pac.RESETS,
+    ));
 
         // Creating a serial port on the bus
         let mut serial = SerialPort::new(usb_bus_alloc);
